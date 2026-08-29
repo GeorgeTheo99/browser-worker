@@ -130,8 +130,18 @@ wait_port_free() {
   die "port $PORT remained bound after service stop"
 }
 start() {
+  local target="gui/$(id -u)/$LABEL" attempt
   [ -f "$PLIST" ] || die "run install first"
-  launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || launchctl kickstart -k "gui/$(id -u)/$LABEL" >/dev/null
+  for attempt in 1 2 3; do
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1; then
+      return 0
+    fi
+    if launchctl print "$target" >/dev/null 2>&1; then
+      launchctl kickstart -k "$target" >/dev/null 2>&1 && return 0
+    fi
+    sleep 1
+  done
+  die "could not bootstrap $LABEL"
 }
 wait_live() {
   local i=0
