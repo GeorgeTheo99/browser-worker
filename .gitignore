@@ -1,0 +1,12 @@
+.DS_Store
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.mypy_cache/
+
+mcp-browser-worker/.venv/
+data/*
+!data/README.md
+
+*.log

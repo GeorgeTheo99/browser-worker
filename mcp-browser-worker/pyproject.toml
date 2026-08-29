@@ -1,0 +1,28 @@
+[project]
+name = "local-browser-worker"
+version = "0.1.0"
+description = "Standalone rendered browser MCP with isolated short-lived sessions"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastmcp==3.4.7",
+  "patchright==1.61.1",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "browser: launches Chromium",
+  "network: accesses the public Internet",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1.4.0",
+  "ruff==0.16.5",
+]

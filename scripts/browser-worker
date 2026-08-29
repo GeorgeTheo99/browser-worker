@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+MCP_DIR="$ROOT_DIR/mcp-browser-worker"
+DEPLOY_ROOT="${BROWSER_WORKER_DEPLOY_ROOT:-$HOME/srv/browser-worker}"
+RELEASES_DIR="$DEPLOY_ROOT/releases"
+CURRENT_LINK="$DEPLOY_ROOT/current"
+DATA_DIR="${BROWSER_WORKER_DATA_DIR:-$DEPLOY_ROOT/shared}"
+PORT="${BROWSER_WORKER_PORT:-8890}"
+LABEL="com.local.mcp-browser-worker"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG_DIR="${BROWSER_WORKER_LOG_DIR:-$HOME/Library/Logs/browser-worker}"
+PYTHON="$CURRENT_LINK/mcp-browser-worker/.venv/bin/python"
+REVISION=""
+
+log() { printf '▶ %s\n' "$*"; }
+ok() { printf '✓ %s\n' "$*"; }
+die() { printf '✗ %s\n' "$*" >&2; exit 1; }
+require() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+ensure_private_dirs() {
+  mkdir -p "$DEPLOY_ROOT" "$RELEASES_DIR" "$DATA_DIR/tokens" "$DATA_DIR/sessions" "$DATA_DIR/artifacts" "$LOG_DIR" "$HOME/Library/LaunchAgents"
+  chmod 700 "$DEPLOY_ROOT" "$RELEASES_DIR"
+  chmod 700 "$DATA_DIR" "$DATA_DIR/tokens" "$DATA_DIR/sessions" "$DATA_DIR/artifacts" "$LOG_DIR"
+  (umask 077; touch "$LOG_DIR/browser-worker.log")
+  chmod 600 "$LOG_DIR/browser-worker.log"
+}
+
+ensure_clients() {
+  ensure_private_dirs
+  if [ ! -f "$DATA_DIR/clients.json" ]; then
+    log "Creating unregistered canary client tokens"
+    (umask 077; python3 - "$DATA_DIR" <<'PY'
+import json,secrets,sys
+from pathlib import Path
+root=Path(sys.argv[1])
+rows=[
+ ("pi-canary", ["fetch","inspect.read","inspect.artifact","inspect.interact","inspect.script"]),
+ ("my-ai-staging", ["fetch","inspect.read"]),
+]
+clients=[]
+for client_id,caps in rows:
+ path=root/"tokens"/client_id
+ path.write_text(secrets.token_urlsafe(48)+"\n",encoding="utf-8")
+ path.chmod(0o600)
+ clients.append({"id":client_id,"token_file":f"tokens/{client_id}","capabilities":caps})
+config=root/"clients.json"
+config.write_text(json.dumps({"version":1,"clients":clients},indent=2)+"\n",encoding="utf-8")
+config.chmod(0o600)
+PY
+    )
+  fi
+  chmod 600 "$DATA_DIR/clients.json" "$DATA_DIR"/tokens/*
+}
+
+source_revision() {
+  [ -d "$ROOT_DIR/.git" ] || die "browser-worker source must be a Git checkout"
+  [ -z "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=all)" ] \
+    || die "browser-worker source must be committed and clean before install"
+  REVISION="$(git -C "$ROOT_DIR" rev-parse HEAD)"
+  printf '%s\n' "$REVISION" | grep -Eq '^[0-9a-f]{40}$' \
+    || die "browser-worker source revision is invalid"
+}
+
+prepare_release() {
+  local release="$RELEASES_DIR/$REVISION" tmp link_tmp
+  if [ ! -d "$release" ]; then
+    tmp="$(mktemp -d "$RELEASES_DIR/.release-$REVISION.XXXXXX")"
+    git -C "$ROOT_DIR" archive --format=tar "$REVISION" | tar -xf - -C "$tmp"
+    printf '%s\n' "$REVISION" > "$tmp/.browser-worker-revision"
+    chmod 600 "$tmp/.browser-worker-revision"
+    log "Synchronizing immutable release $REVISION"
+    uv sync --project "$tmp/mcp-browser-worker" --locked >/dev/null
+    mv "$tmp" "$release"
+  fi
+  [ "$(tr -d '\r\n' < "$release/.browser-worker-revision")" = "$REVISION" ] \
+    || die "browser-worker release receipt mismatch"
+  [ -x "$release/mcp-browser-worker/.venv/bin/python" ] \
+    || die "browser-worker release environment missing"
+  link_tmp="$DEPLOY_ROOT/.current-$REVISION-$$"
+  ln -s "releases/$REVISION" "$link_tmp"
+  python3 - "$link_tmp" "$CURRENT_LINK" <<'PY'
+import os, sys
+os.replace(sys.argv[1], sys.argv[2])
+PY
+  [ "$(readlink "$CURRENT_LINK")" = "releases/$REVISION" ] \
+    || die "browser-worker current release switch failed"
+}
+
+plist_content() {
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$LABEL</string>
+<key>ProgramArguments</key><array><string>$PYTHON</string><string>$CURRENT_LINK/mcp-browser-worker/http_server.py</string></array>
+<key>WorkingDirectory</key><string>$CURRENT_LINK/mcp-browser-worker</string>
+<key>EnvironmentVariables</key><dict>
+  <key>BROWSER_WORKER_DATA_DIR</key><string>$DATA_DIR</string>
+  <key>BROWSER_WORKER_DEPLOY_REVISION</key><string>$REVISION</string>
+  <key>BROWSER_WORKER_PORT</key><string>$PORT</string>
+  <key>FASTMCP_SHOW_SERVER_BANNER</key><string>false</string>
+</dict>
+<key>StandardOutPath</key><string>$LOG_DIR/browser-worker.log</string>
+<key>StandardErrorPath</key><string>$LOG_DIR/browser-worker.log</string>
+<key>KeepAlive</key><true/><key>RunAtLoad</key><true/><key>ThrottleInterval</key><integer>5</integer>
+<key>Umask</key><integer>63</integer>
+</dict></plist>
+EOF
+}
+
+write_plist() {
+  local tmp
+  tmp="$(mktemp "$HOME/Library/LaunchAgents/.$LABEL.XXXXXX")"
+  (umask 077; plist_content >"$tmp")
+  chmod 600 "$tmp"
+  plutil -lint "$tmp" >/dev/null || { rm -f "$tmp"; die "invalid launchd plist"; }
+  mv -f "$tmp" "$PLIST"
+}
+
+bootout() { launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true; }
+start() {
+  [ -f "$PLIST" ] || die "run install first"
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || launchctl kickstart -k "gui/$(id -u)/$LABEL" >/dev/null
+}
+wait_live() {
+  local i=0
+  while [ "$i" -lt 30 ]; do
+    curl -fsS --max-time 2 "http://127.0.0.1:$PORT/live" 2>/dev/null | grep -q '"status":"ok"' && return 0
+    sleep 1; i=$((i+1))
+  done
+  return 1
+}
+
+token() { tr -d '\r\n' <"$DATA_DIR/tokens/pi-canary"; }
+verify() {
+  wait_live || die "browser-worker did not become live"
+  local tools health_revision
+  health_revision="$(curl -fsS --max-time 5 "http://127.0.0.1:$PORT/health" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("revision", ""))')"
+  [ "$health_revision" = "$(tr -d '\r\n' < "$CURRENT_LINK/.browser-worker-revision")" ] \
+    || die "live browser-worker revision mismatch"
+  tools="$(curl -fsS --max-time 10 -X POST "http://127.0.0.1:$PORT/mcp" \
+    -H 'accept: application/json' -H 'content-type: application/json' \
+    -H "authorization: Bearer $(token)" \
+    -d '{"jsonrpc":"2.0","id":"verify","method":"tools/list","params":{}}' \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(",".join(sorted(t["name"] for t in d["result"]["tools"])))')"
+  [ "$tools" = "browser_fetch,browser_inspect" ] || die "unexpected tool inventory: $tools"
+  ok "exact MCP tool inventory: $tools"
+}
+
+install_cmd() {
+  local no_start=0
+  [ "${1:-}" = "--no-start" ] && no_start=1
+  require uv; require python3; require curl; require launchctl; require plutil; require tar
+  source_revision
+  ensure_clients
+  prepare_release
+  write_plist
+  if [ "$no_start" -eq 0 ]; then bootout; start; verify; fi
+  ok "browser-worker installed"
+}
+
+status() {
+  launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state/ {print "launchd: "$2; found=1; exit} END{if(!found) print "launchd: not-loaded"}'
+  curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null || true; printf '\n'
+}
+
+case "${1:-}" in
+  install) shift; install_cmd "$@" ;;
+  start) start; wait_live; ok started ;;
+  stop) bootout; ok stopped ;;
+  restart) bootout; start; wait_live; ok restarted ;;
+  verify) verify ;;
+  status) status ;;
+  logs) tail "${2:--50}" "$LOG_DIR/browser-worker.log" ;;
+  check) uv sync --project "$MCP_DIR" --locked >/dev/null; "$MCP_DIR/.venv/bin/ruff" check "$MCP_DIR"; "$MCP_DIR/.venv/bin/pytest" -q "$MCP_DIR/tests"; "$MCP_DIR/.venv/bin/python" -m py_compile "$MCP_DIR"/*.py; bash -n "$ROOT_DIR/install.sh" "$0"; git -C "$ROOT_DIR" diff --check ;;
+  env) printf 'ROOT_DIR=%s\nDEPLOY_ROOT=%s\nCURRENT_LINK=%s\nDATA_DIR=%s\nPORT=%s\nLABEL=%s\nLOG_DIR=%s\n' "$ROOT_DIR" "$DEPLOY_ROOT" "$CURRENT_LINK" "$DATA_DIR" "$PORT" "$LABEL" "$LOG_DIR" ;;
+  uninstall) bootout; rm -f "$PLIST"; ok "uninstalled; private data retained" ;;
+  *) echo "usage: $0 {install [--no-start]|start|stop|restart|verify|status|logs|check|env|uninstall}" >&2; exit 2 ;;
+esac
