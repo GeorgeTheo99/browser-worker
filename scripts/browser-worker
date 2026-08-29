@@ -176,7 +176,7 @@ case "${1:-}" in
   verify) verify ;;
   status) status ;;
   logs) tail "${2:--50}" "$LOG_DIR/browser-worker.log" ;;
-  check) uv sync --project "$MCP_DIR" --locked >/dev/null; "$MCP_DIR/.venv/bin/ruff" check "$MCP_DIR"; "$MCP_DIR/.venv/bin/pytest" -q "$MCP_DIR/tests"; "$MCP_DIR/.venv/bin/python" -m py_compile "$MCP_DIR"/*.py; bash -n "$ROOT_DIR/install.sh" "$0"; git -C "$ROOT_DIR" diff --check ;;
+  check) uv sync --project "$MCP_DIR" --locked >/dev/null; (cd "$MCP_DIR" && .venv/bin/ruff check . && .venv/bin/pytest -q tests && .venv/bin/python -m py_compile ./*.py); bash -n "$ROOT_DIR/install.sh" "$0"; git -C "$ROOT_DIR" diff --check ;;
   env) printf 'ROOT_DIR=%s\nDEPLOY_ROOT=%s\nCURRENT_LINK=%s\nDATA_DIR=%s\nPORT=%s\nLABEL=%s\nLOG_DIR=%s\n' "$ROOT_DIR" "$DEPLOY_ROOT" "$CURRENT_LINK" "$DATA_DIR" "$PORT" "$LABEL" "$LOG_DIR" ;;
   uninstall) bootout; rm -f "$PLIST"; ok "uninstalled; private data retained" ;;
   *) echo "usage: $0 {install [--no-start]|start|stop|restart|verify|status|logs|check|env|uninstall}" >&2; exit 2 ;;
