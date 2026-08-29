@@ -121,8 +121,8 @@ prepare_release() {
     log "Synchronizing immutable release $REVISION"
     uv sync --project "$tmp/mcp-browser-worker" --locked >/dev/null
     verify_release "$tmp" "$REVISION" create
-    chmod -R a-w "$tmp"
     mv "$tmp" "$release"
+    chmod -R a-w "$release"
   fi
   verify_release "$release" "$REVISION"
   [ "$(tr -d '\r\n' < "$release/.browser-worker-revision")" = "$REVISION" ] \
