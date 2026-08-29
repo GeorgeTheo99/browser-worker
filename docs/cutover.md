@@ -10,9 +10,9 @@ My AI's independent `web_search` and `web_fetch` tools remain available because 
 
 ## Current canary receipts
 
-- Worker: loopback `127.0.0.1:8890`, exact tools `browser_fetch,browser_inspect`.
+- Worker canary release: `749522b18fb3c98edb671e9c3747bc6de0bf05b7`, loopback `127.0.0.1:8890`, exact tools `browser_fetch,browser_inspect`.
 - Pi: isolated temporary `PI_CODING_AGENT_DIR`, explicit canary extension only; `browser_fetch` returned `Example Domain`.
-- My AI staging revision after lifecycle hardening: `7fec10be2746f014e4211eaf6d03d2324f803508`.
+- My AI staging revision after scoped lost-response cleanup: `84fb8c92e1957549cf75690a59fce8f8c366ea46`.
 - My AI staging `browser_fetch`: completed and persisted a browser-worker receipt.
 - My AI staging `browser_inspect`: completed `open → extract_text → close`; worker returned to zero live sessions.
 - My AI production revision and Pi shared package are unchanged.
