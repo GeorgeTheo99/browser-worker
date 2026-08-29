@@ -313,7 +313,13 @@ class PublicEgressProxy:
             if upstream_writer is not None:
                 self._writers.discard(upstream_writer)
                 upstream_writer.close()
-                await upstream_writer.wait_closed()
+                try:
+                    await upstream_writer.wait_closed()
+                except (ConnectionError, OSError) as exc:
+                    logger.debug("upstream proxy close ended: %s", type(exc).__name__)
             self._writers.discard(writer)
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError) as exc:
+                logger.debug("client proxy close ended: %s", type(exc).__name__)
