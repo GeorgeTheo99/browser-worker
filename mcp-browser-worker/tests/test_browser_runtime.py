@@ -27,11 +27,19 @@ async def test_ephemeral_rendered_session_and_private_subresource_block(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     requests: list[str] = []
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
 
     async def fixture(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         head = await reader.read(65536)
         first = head.split(b"\r\n", 1)[0].decode("latin-1")
         requests.append(first)
+        if " /slow " in first:
+            slow_started.set()
+            await release_slow.wait()
+            writer.close()
+            await writer.wait_closed()
+            return
         if " /redirect " in first:
             writer.write(
                 f"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".encode()
@@ -118,6 +126,22 @@ async def test_ephemeral_rendered_session_and_private_subresource_block(
         assert cookie["result"] == ""
         await manager.close("owner", fresh_id)
 
+        slow_task = asyncio.create_task(
+            manager.open(
+                "owner",
+                f"http://public.test:{port}/slow",
+                wait_until="domcontentloaded",
+                timeout_ms=15_000,
+            )
+        )
+        await slow_started.wait()
+        slow_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await slow_task
+        assert manager.live_sessions == 0
+        assert list((tmp_path / "sessions").iterdir()) == []
+        release_slow.set()
+
         with pytest.raises(WorkerError, match="public-network policy"):
             await manager.open(
                 "owner",
@@ -129,6 +153,7 @@ async def test_ephemeral_rendered_session_and_private_subresource_block(
         assert list((tmp_path / "sessions").iterdir()) == []
         assert not any(" /private " in request for request in requests)
     finally:
+        release_slow.set()
         await manager.shutdown()
         await artifacts.close()
         server.close()
