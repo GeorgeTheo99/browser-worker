@@ -21,7 +21,7 @@ Pi's `app_*` local/private testing tools remain in-process and out of scope.
 - Data: owner-only `~/srv/browser-worker/shared`; configurable with `BROWSER_WORKER_DATA_DIR`
 - Logs: owner-only `~/Library/Logs/browser-worker/`
 
-The operator installs a locked environment inside an exact Git-archive release, writes a revision receipt, atomically selects it, and refuses dirty/uncommitted source. Health reports the deployed revision. The service has independent `/live`, `/ready`, and `/health` endpoints.
+The operator installs a locked environment inside an exact Git-archive release, writes and verifies a complete source manifest plus revision receipt, removes write permissions from the finalized snapshot, atomically selects it, and refuses dirty/uncommitted source. Health reports the deployed revision. The service has independent `/live`, `/ready`, and `/health` endpoints.
 
 ## Tool contracts
 

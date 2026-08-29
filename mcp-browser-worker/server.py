@@ -34,6 +34,7 @@ InspectAction = Literal[
     "open",
     "state",
     "close",
+    "cleanup_scope",
     "navigate",
     "open_tab",
     "list_tabs",
@@ -178,6 +179,7 @@ async def browser_fetch(
 async def browser_inspect(
     action: InspectAction,
     session_id: Annotated[str | None, Field(max_length=128)] = None,
+    scope_id: Annotated[str | None, Field(max_length=128)] = None,
     url: Annotated[str | None, Field(max_length=8192)] = None,
     selector: Annotated[str | None, Field(max_length=2000)] = None,
     text: Annotated[str | None, Field(max_length=20_000)] = None,
@@ -207,9 +209,24 @@ async def browser_inspect(
                 raise WorkerError("session_id is not accepted for open")
             if url is not None:
                 _bounded_text(url, name="url", maximum=8192, required=True)
+            scope = _bounded_text(scope_id, name="scope_id", maximum=128)
             return await _safe_call(
-                manager.open(caller.id, url, wait_until=wait_until, timeout_ms=timeout)
+                manager.open(
+                    caller.id,
+                    url,
+                    wait_until=wait_until,
+                    timeout_ms=timeout,
+                    scope_id=scope,
+                )
             )
+        if action == "cleanup_scope":
+            if session_id is not None:
+                raise WorkerError("session_id is not accepted for cleanup_scope")
+            scope = _bounded_text(
+                scope_id, name="scope_id", maximum=128, required=True
+            )
+            assert scope is not None
+            return await _safe_call(manager.cleanup_scope(caller.id, scope))
         sid = _bounded_text(session_id, name="session_id", maximum=128, required=True)
         assert sid is not None
 

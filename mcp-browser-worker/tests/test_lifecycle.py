@@ -158,6 +158,73 @@ async def test_cancellation_and_context_crash_evict_sessions(
 
 
 @pytest.mark.asyncio
+async def test_scope_cleanup_closes_known_and_inflight_opens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, artifacts = await fake_manager(tmp_path, monkeypatch)
+    known = await manager.open(
+        "owner", None, wait_until="domcontentloaded", timeout_ms=1000, scope_id="run-scope"
+    )
+    result = await manager.cleanup_scope("owner", "run-scope")
+    assert result == {"status": "closed", "closed_count": 1}
+    assert manager.live_sessions == 0
+    assert not (tmp_path / "sessions" / str(known["session_id"])).exists()
+    with pytest.raises(WorkerError, match="scope is already closed"):
+        await manager.open(
+            "owner", None, wait_until="domcontentloaded", timeout_ms=1000, scope_id="run-scope"
+        )
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_context(_profile: Path, proxy: Any) -> FakeContext:
+        await proxy.start()
+        started.set()
+        await release.wait()
+        return FakeContext()
+
+    monkeypatch.setattr(manager, "_new_context", delayed_context)
+    opening = asyncio.create_task(
+        manager.open(
+            "owner", None, wait_until="domcontentloaded", timeout_ms=1000, scope_id="late-scope"
+        )
+    )
+    await started.wait()
+    await manager.cleanup_scope("owner", "late-scope")
+    release.set()
+    with pytest.raises(WorkerError, match="closed during startup"):
+        await opening
+    assert manager.live_sessions == 0
+    assert list((tmp_path / "sessions").iterdir()) == []
+    await artifacts.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_contended_close_still_disposes_untracked_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, artifacts = await fake_manager(tmp_path, monkeypatch)
+    state = await manager.open("owner", None, wait_until="domcontentloaded", timeout_ms=1000)
+    session_id = str(state["session_id"])
+    session = manager._sessions[session_id]
+    await session.lock.acquire()
+    close_task = asyncio.create_task(manager.close("owner", session_id))
+    for _ in range(50):
+        if manager.live_sessions == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert manager.live_sessions == 0
+    close_task.cancel()
+    session.lock.release()
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+    assert session.context.closed
+    assert session.proxy.port is None
+    assert not (tmp_path / "sessions" / session_id).exists()
+    await artifacts.close()
+
+
+@pytest.mark.asyncio
 async def test_operation_admission_fails_without_unbounded_queue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

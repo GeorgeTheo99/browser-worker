@@ -73,6 +73,7 @@ const browserInspect = defineTool({
   parameters: Type.Object({
     action: Type.String({ description: "Worker action such as open, extract_text, click, state, or close" }),
     session_id: Type.Optional(Type.String()),
+    scope_id: Type.Optional(Type.String()),
     url: Type.Optional(Type.String()),
     selector: Type.Optional(Type.String()),
     text: Type.Optional(Type.String()),

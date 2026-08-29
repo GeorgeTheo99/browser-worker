@@ -74,6 +74,7 @@ def chromium_hardening_args() -> list[str]:
 class BrowserSession:
     id: str
     owner: str
+    scope_id: str | None
     created_mono: float
     touched_mono: float
     profile_dir: Path
@@ -100,6 +101,7 @@ class BrowserManager:
         self.sessions_dir = sessions_dir
         self._playwright: Playwright | None = None
         self._sessions: dict[str, BrowserSession] = {}
+        self._closed_scopes: dict[tuple[str, str], float] = {}
         self._starting_global = 0
         self._starting_by_owner: dict[str, int] = {}
         self._state_lock = asyncio.Lock()
@@ -141,6 +143,7 @@ class BrowserManager:
         async with self._state_lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            self._closed_scopes.clear()
         await asyncio.gather(
             *(self._dispose_after_action(session) for session in sessions), return_exceptions=True
         )
@@ -165,6 +168,11 @@ class BrowserManager:
             ]
             for session in expired:
                 self._sessions.pop(session.id, None)
+            self._closed_scopes = {
+                key: closed_at
+                for key, closed_at in self._closed_scopes.items()
+                if now - closed_at <= ABSOLUTE_TTL_SECONDS
+            }
         await asyncio.gather(
             *(self._dispose_after_action(session) for session in expired), return_exceptions=True
         )
@@ -237,10 +245,20 @@ class BrowserManager:
         page.on("console", on_console)
         page.on("download", lambda download: asyncio.create_task(download.cancel()))
 
-    async def open(self, owner: str, url: str | None, *, wait_until: WaitUntil, timeout_ms: int) -> dict[str, object]:
+    async def open(
+        self,
+        owner: str,
+        url: str | None,
+        *,
+        wait_until: WaitUntil,
+        timeout_ms: int,
+        scope_id: str | None = None,
+    ) -> dict[str, object]:
         async with self.operation():
             await self.sweep()
             async with self._state_lock:
+                if scope_id and (owner, scope_id) in self._closed_scopes:
+                    raise WorkerError("browser session scope is already closed")
                 owner_count = sum(session.owner == owner for session in self._sessions.values())
                 owner_count += self._starting_by_owner.get(owner, 0)
                 if len(self._sessions) + self._starting_global >= MAX_GLOBAL_SESSIONS:
@@ -259,7 +277,9 @@ class BrowserManager:
             try:
                 context = await self._new_context(profile_dir, proxy)
                 now = time.monotonic()
-                session = BrowserSession(session_id, owner, now, now, profile_dir, proxy, context)
+                session = BrowserSession(
+                    session_id, owner, scope_id, now, now, profile_dir, proxy, context
+                )
                 for page in context.pages:
                     self._attach_page(session, page)
                 context.on("page", lambda page: self._attach_page(session, page))
@@ -271,6 +291,8 @@ class BrowserManager:
                     page = await context.new_page()
                     self._attach_page(session, page)
                 async with self._state_lock:
+                    if scope_id and (owner, scope_id) in self._closed_scopes:
+                        raise WorkerError("browser session scope was closed during startup")
                     self._sessions[session_id] = session
                     inserted = True
                 if url:
@@ -311,13 +333,45 @@ class BrowserManager:
             raise WorkerError("browser session not found")
         return session
 
+    async def cleanup_scope(self, owner: str, scope_id: str) -> dict[str, object]:
+        async with self._state_lock:
+            self._closed_scopes[(owner, scope_id)] = time.monotonic()
+            sessions = [
+                session
+                for session in self._sessions.values()
+                if session.owner == owner and session.scope_id == scope_id
+            ]
+            for session in sessions:
+                self._sessions.pop(session.id, None)
+        await asyncio.gather(
+            *(self._dispose_after_action(session) for session in sessions),
+            return_exceptions=True,
+        )
+        return {"status": "closed", "closed_count": len(sessions)}
+
     async def close(self, owner: str, session_id: str) -> dict[str, object]:
         async with self._state_lock:
             session = self._sessions.get(session_id)
             if session is None or session.owner != owner:
                 raise WorkerError("browser session not found")
-            self._sessions.pop(session_id, None)
-        await self._dispose_after_action(session)
+
+        async def evict_and_dispose() -> None:
+            async with self._state_lock:
+                if self._sessions.get(session_id) is session:
+                    self._sessions.pop(session_id, None)
+            await self._dispose_after_action(session)
+
+        cleanup = asyncio.create_task(
+            evict_and_dispose(), name=f"browser-close-{session_id}"
+        )
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            try:
+                async with asyncio.timeout(15):
+                    await asyncio.shield(cleanup)
+            finally:
+                raise
         return {"status": "closed", "session_id": session_id}
 
     async def _handle_context_closed(self, session: BrowserSession) -> None:
