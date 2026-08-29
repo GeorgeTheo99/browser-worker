@@ -379,9 +379,17 @@ class BrowserManager:
     async def _navigate(self, session: BrowserSession, url: str, *, wait_until: WaitUntil, timeout_ms: int) -> None:
         await resolve_public_url(url, session.proxy.resolver)
         page = self._active_page(session)
+        navigation = asyncio.create_task(
+            page.goto(url, wait_until=wait_until, timeout=timeout_ms),
+            name=f"browser-navigate-{session.id}",
+        )
         try:
-            await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+            await navigation
             await resolve_public_url(page.url, session.proxy.resolver)
+        except asyncio.CancelledError:
+            navigation.cancel()
+            await asyncio.gather(navigation, return_exceptions=True)
+            raise
         except NetworkPolicyError as exc:
             raise WorkerError("browser navigation was blocked by public-network policy") from exc
         except Exception as exc:
