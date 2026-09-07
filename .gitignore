@@ -10,3 +10,15 @@ data/*
 !data/README.md
 
 *.log
+
+# Local credentials and private configuration
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+tokens/
+clients.json
