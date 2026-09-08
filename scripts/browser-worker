@@ -2,61 +2,110 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 MCP_DIR="$ROOT_DIR/mcp-browser-worker"
 DEPLOY_ROOT="${BROWSER_WORKER_DEPLOY_ROOT:-$HOME/srv/browser-worker}"
 RELEASES_DIR="$DEPLOY_ROOT/releases"
 CURRENT_LINK="$DEPLOY_ROOT/current"
 DATA_DIR="${BROWSER_WORKER_DATA_DIR:-$DEPLOY_ROOT/shared}"
 PORT="${BROWSER_WORKER_PORT:-8890}"
+INSTALLED_PORT="$PORT"
 LABEL="com.local.mcp-browser-worker"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="${BROWSER_WORKER_LOG_DIR:-$HOME/Library/Logs/browser-worker}"
 PYTHON="$CURRENT_LINK/mcp-browser-worker/.venv/bin/python"
 REVISION=""
+BOOTSTRAP_PYTHON=""
+BROWSER_EXECUTABLE="${BROWSER_WORKER_BROWSER_EXECUTABLE:-}"
+export PYTHONDONTWRITEBYTECODE=1
 
 log() { printf '▶ %s\n' "$*"; }
 ok() { printf '✓ %s\n' "$*"; }
 die() { printf '✗ %s\n' "$*" >&2; exit 1; }
-require() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+require() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1 (install it, then retry)"; }
+
+bootstrap_python() {
+  require uv
+  BOOTSTRAP_PYTHON="$(uv python find 3.12 2>/dev/null || true)"
+  if [ -z "$BOOTSTRAP_PYTHON" ]; then
+    uv python install 3.12 || die "Python 3.12 provisioning failed; check network/proxy access and retry"
+    BOOTSTRAP_PYTHON="$(uv python find 3.12)"
+  fi
+  "$BOOTSTRAP_PYTHON" -c 'import sys, json, plistlib; assert sys.version_info[:2] == (3,12)' \
+    || die "a working Python 3.12 interpreter is required"
+}
+
+load_installed_paths() {
+  local saved key value
+  saved="$("$BOOTSTRAP_PYTHON" - "$PLIST" <<'PY'
+import os, pathlib, plistlib, stat, sys
+path=pathlib.Path(sys.argv[1])
+if path.exists() or path.is_symlink():
+    info=path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise SystemExit('installed plist must be private, regular and owned by this user')
+    with path.open('rb') as stream: document=plistlib.load(stream)
+    if not isinstance(document,dict) or document.get('Label') != 'com.local.mcp-browser-worker':
+        raise SystemExit('installed plist is not the browser-worker service')
+    env=document.get('EnvironmentVariables', {})
+    if not isinstance(env,dict): raise SystemExit('invalid installed environment metadata')
+    # Older releases stored deploy/log paths only in the program/log entries.
+    program = document.get('ProgramArguments', [])
+    if 'BROWSER_WORKER_DEPLOY_ROOT' not in env and program and isinstance(program[0], str):
+        binary = pathlib.Path(program[0])
+        if binary.parts[-5:] == ('current','mcp-browser-worker','.venv','bin','python'):
+            env['BROWSER_WORKER_DEPLOY_ROOT'] = str(binary.parents[4])
+    if 'BROWSER_WORKER_LOG_DIR' not in env and isinstance(document.get('StandardOutPath'), str):
+        env['BROWSER_WORKER_LOG_DIR'] = str(pathlib.Path(document['StandardOutPath']).parent)
+    for key in ('BROWSER_WORKER_DEPLOY_ROOT','BROWSER_WORKER_DATA_DIR','BROWSER_WORKER_PORT','BROWSER_WORKER_BROWSER_EXECUTABLE','BROWSER_WORKER_LOG_DIR'):
+        value=env.get(key)
+        if value is not None:
+            if not isinstance(value,str) or any(c in value for c in '\r\n\t'):
+                raise SystemExit('invalid installed worker path/port metadata')
+            print(key+'\t'+value)
+PY
+)" || die "cannot read installed settings safely; inspect $PLIST"
+  while IFS=$'\t' read -r key value; do
+    case "$key" in
+      BROWSER_WORKER_DEPLOY_ROOT) [ "${BROWSER_WORKER_DEPLOY_ROOT+x}" = x ] || DEPLOY_ROOT="$value" ;;
+      BROWSER_WORKER_DATA_DIR) [ "${BROWSER_WORKER_DATA_DIR+x}" = x ] || DATA_DIR="$value" ;;
+      BROWSER_WORKER_PORT) INSTALLED_PORT="$value"; [ "${BROWSER_WORKER_PORT+x}" = x ] || PORT="$value" ;;
+      BROWSER_WORKER_BROWSER_EXECUTABLE) [ "${BROWSER_WORKER_BROWSER_EXECUTABLE+x}" = x ] || BROWSER_EXECUTABLE="$value" ;;
+      BROWSER_WORKER_LOG_DIR) [ "${BROWSER_WORKER_LOG_DIR+x}" = x ] || LOG_DIR="$value" ;;
+    esac
+  done <<< "$saved"
+  [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] \
+    || die "BROWSER_WORKER_PORT must be between 1024 and 65535"
+  local directory
+  for directory in "$DEPLOY_ROOT" "$DATA_DIR" "$LOG_DIR"; do
+    [[ "$directory" = /* ]] && [ "$directory" != / ] && [ "$directory" != "$HOME" ] \
+      || die "worker directories must be absolute dedicated paths, not HOME or /"
+  done
+  RELEASES_DIR="$DEPLOY_ROOT/releases"
+  CURRENT_LINK="$DEPLOY_ROOT/current"
+  PYTHON="$CURRENT_LINK/mcp-browser-worker/.venv/bin/python"
+  export BROWSER_WORKER_BROWSER_EXECUTABLE="$BROWSER_EXECUTABLE"
+}
 
 ensure_private_dirs() {
-  mkdir -p "$DEPLOY_ROOT" "$RELEASES_DIR" "$DATA_DIR/tokens" "$DATA_DIR/sessions" "$DATA_DIR/artifacts" "$LOG_DIR" "$HOME/Library/LaunchAgents"
-  chmod 700 "$DEPLOY_ROOT" "$RELEASES_DIR"
-  chmod 700 "$DATA_DIR" "$DATA_DIR/tokens" "$DATA_DIR/sessions" "$DATA_DIR/artifacts" "$LOG_DIR"
-  (umask 077; touch "$LOG_DIR/browser-worker.log")
-  chmod 600 "$LOG_DIR/browser-worker.log"
+  "$BOOTSTRAP_PYTHON" "$MCP_DIR/operator_support.py" dirs "$DEPLOY_ROOT" "$RELEASES_DIR" "$DATA_DIR" \
+    "$DATA_DIR/tokens" "$DATA_DIR/sessions" "$DATA_DIR/artifacts" "$LOG_DIR"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  [ ! -L "$LOG_DIR/browser-worker.log" ] || die "refusing symlinked log file"
+  if [ ! -e "$LOG_DIR/browser-worker.log" ]; then
+    (set -C; umask 077; : > "$LOG_DIR/browser-worker.log")
+  fi
+  "$BOOTSTRAP_PYTHON" "$MCP_DIR/operator_support.py" files "$LOG_DIR/browser-worker.log"
 }
 
 ensure_clients() {
-  ensure_private_dirs
-  if [ ! -f "$DATA_DIR/clients.json" ]; then
-    log "Creating unregistered canary client tokens"
-    (umask 077; python3 - "$DATA_DIR" <<'PY'
-import json,secrets,sys
-from pathlib import Path
-root=Path(sys.argv[1])
-rows=[
- ("pi-canary", ["fetch","inspect.read","inspect.artifact","inspect.interact","inspect.script"]),
- ("my-ai-staging", ["fetch","inspect.read"]),
-]
-clients=[]
-for client_id,caps in rows:
- path=root/"tokens"/client_id
- path.write_text(secrets.token_urlsafe(48)+"\n",encoding="utf-8")
- path.chmod(0o600)
- clients.append({"id":client_id,"token_file":f"tokens/{client_id}","capabilities":caps})
-config=root/"clients.json"
-config.write_text(json.dumps({"version":1,"clients":clients},indent=2)+"\n",encoding="utf-8")
-config.chmod(0o600)
-PY
-    )
-  fi
-  chmod 600 "$DATA_DIR/clients.json" "$DATA_DIR"/tokens/*
+  "$RELEASES_DIR/$REVISION/mcp-browser-worker/.venv/bin/python" \
+    "$RELEASES_DIR/$REVISION/mcp-browser-worker/operator_support.py" clients "$DATA_DIR"
 }
 
 source_revision() {
-  [ -d "$ROOT_DIR/.git" ] || die "browser-worker source must be a Git checkout"
+  [ "$(git -C "$ROOT_DIR" rev-parse --show-toplevel 2>/dev/null)" = "$ROOT_DIR" ] \
+    || die "browser-worker source must be a Git checkout"
   [ -z "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=all)" ] \
     || die "browser-worker source must be committed and clean before install"
   REVISION="$(git -C "$ROOT_DIR" rev-parse HEAD)"
@@ -66,7 +115,7 @@ source_revision() {
 
 verify_release() {
   local release="$1" revision="$2" mode="${3:-verify}"
-  python3 - "$release" "$revision" "$mode" <<'PY'
+  "$BOOTSTRAP_PYTHON" - "$release" "$revision" "$mode" <<'PY'
 import hashlib, json, os, stat, sys
 from pathlib import Path
 
@@ -115,23 +164,39 @@ prepare_release() {
   local release="$RELEASES_DIR/$REVISION" tmp link_tmp
   if [ ! -d "$release" ]; then
     tmp="$(mktemp -d "$RELEASES_DIR/.release-$REVISION.XXXXXX")"
+    preparing_dir="$tmp"
     git -C "$ROOT_DIR" archive --format=tar "$REVISION" | tar -xf - -C "$tmp"
     printf '%s\n' "$REVISION" > "$tmp/.browser-worker-revision"
     chmod 600 "$tmp/.browser-worker-revision"
     log "Synchronizing immutable release $REVISION"
-    uv sync --project "$tmp/mcp-browser-worker" --locked >/dev/null
+    uv sync --project "$tmp/mcp-browser-worker" --locked --python "$BOOTSTRAP_PYTHON" --no-dev >/dev/null
     verify_release "$tmp" "$REVISION" create
+    # Finalize and verify privately before the atomic rename. An interruption
+    # after rename must leave a complete reusable release, not a poisoned cache.
+    chmod -R a-w "$tmp"
+    verify_release "$tmp" "$REVISION"
     mv "$tmp" "$release"
-    chmod -R a-w "$release"
+    preparing_dir=""
   fi
-  verify_release "$release" "$REVISION"
+  verify_release "$release" "$REVISION" \
+    || die "existing release failed integrity verification; preserve active state and restore/rebuild $release before retrying"
   [ "$(tr -d '\r\n' < "$release/.browser-worker-revision")" = "$REVISION" ] \
     || die "browser-worker release receipt mismatch"
   [ -x "$release/mcp-browser-worker/.venv/bin/python" ] \
-    || die "browser-worker release environment missing"
-  link_tmp="$DEPLOY_ROOT/.current-$REVISION-$$"
+    || die "browser-worker release environment missing: $release (restore/rebuild this release before retrying)"
+  # Run on every install so a removed browser cache is repaired too. Do not
+  # garbage-collect browser versions used by other apps or Pi's app_* tools.
+  if [ -z "$BROWSER_EXECUTABLE" ]; then
+    log "Provisioning matching Chromium (cached installations are reused)"
+    PLAYWRIGHT_SKIP_BROWSER_GC=1 "$release/mcp-browser-worker/.venv/bin/python" -m patchright install chromium
+  fi
+}
+
+select_release() {
+  local link_tmp="$DEPLOY_ROOT/.current-$REVISION-$$"
+  [ ! -e "$CURRENT_LINK" ] || [ -L "$CURRENT_LINK" ] || die "current must be an installer-managed symlink"
   ln -s "releases/$REVISION" "$link_tmp"
-  python3 - "$link_tmp" "$CURRENT_LINK" <<'PY'
+  "$BOOTSTRAP_PYTHON" - "$link_tmp" "$CURRENT_LINK" <<'PY'
 import os, sys
 os.replace(sys.argv[1], sys.argv[2])
 PY
@@ -140,25 +205,20 @@ PY
 }
 
 plist_content() {
-  cat <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>$LABEL</string>
-<key>ProgramArguments</key><array><string>$PYTHON</string><string>$CURRENT_LINK/mcp-browser-worker/http_server.py</string></array>
-<key>WorkingDirectory</key><string>$CURRENT_LINK/mcp-browser-worker</string>
-<key>EnvironmentVariables</key><dict>
-  <key>BROWSER_WORKER_DATA_DIR</key><string>$DATA_DIR</string>
-  <key>BROWSER_WORKER_DEPLOY_REVISION</key><string>$REVISION</string>
-  <key>BROWSER_WORKER_PORT</key><string>$PORT</string>
-  <key>FASTMCP_SHOW_SERVER_BANNER</key><string>false</string>
-</dict>
-<key>StandardOutPath</key><string>$LOG_DIR/browser-worker.log</string>
-<key>StandardErrorPath</key><string>$LOG_DIR/browser-worker.log</string>
-<key>KeepAlive</key><true/><key>RunAtLoad</key><true/><key>ThrottleInterval</key><integer>5</integer>
-<key>Umask</key><integer>63</integer>
-</dict></plist>
-EOF
+  "$BOOTSTRAP_PYTHON" - "$PLIST" "$LABEL" "$PYTHON" "$CURRENT_LINK" "$DEPLOY_ROOT" "$DATA_DIR" "$REVISION" "$PORT" "$LOG_DIR" "$BROWSER_EXECUTABLE" <<'PY'
+import pathlib, plistlib, sys
+old, label, python, current, deploy, data, revision, port, logs, browser = sys.argv[1:]
+env = {}
+if pathlib.Path(old).is_file():
+    with open(old, 'rb') as stream: env = plistlib.load(stream).get('EnvironmentVariables', {})
+env.update(BROWSER_WORKER_DATA_DIR=data, BROWSER_WORKER_DEPLOY_ROOT=deploy, BROWSER_WORKER_LOG_DIR=logs,
+           BROWSER_WORKER_DEPLOY_REVISION=revision, BROWSER_WORKER_PORT=port,
+           BROWSER_WORKER_BROWSER_EXECUTABLE=browser, PYTHONDONTWRITEBYTECODE='1', FASTMCP_SHOW_SERVER_BANNER='false')
+plistlib.dump({'Label':label, 'ProgramArguments':[python, current+'/mcp-browser-worker/http_server.py'],
+              'WorkingDirectory':current+'/mcp-browser-worker', 'EnvironmentVariables':env,
+              'StandardOutPath':logs+'/browser-worker.log', 'StandardErrorPath':logs+'/browser-worker.log',
+              'KeepAlive':True, 'RunAtLoad':True, 'ThrottleInterval':5, 'Umask':63}, sys.stdout.buffer)
+PY
 }
 
 write_plist() {
@@ -202,33 +262,92 @@ wait_live() {
   return 1
 }
 
-token() { tr -d '\r\n' <"$DATA_DIR/tokens/pi-canary"; }
 verify() {
-  wait_live || die "browser-worker did not become live"
-  local tools health_revision
-  health_revision="$(curl -fsS --max-time 5 "http://127.0.0.1:$PORT/health" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("revision", ""))')"
-  [ "$health_revision" = "$(tr -d '\r\n' < "$CURRENT_LINK/.browser-worker-revision")" ] \
-    || die "live browser-worker revision mismatch"
-  tools="$(curl -fsS --max-time 10 -X POST "http://127.0.0.1:$PORT/mcp" \
-    -H 'accept: application/json' -H 'content-type: application/json' \
-    -H "authorization: Bearer $(token)" \
-    -d '{"jsonrpc":"2.0","id":"verify","method":"tools/list","params":{}}' \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(",".join(sorted(t["name"] for t in d["result"]["tools"])))')"
-  [ "$tools" = "browser_fetch,browser_inspect" ] || die "unexpected tool inventory: $tools"
-  ok "exact MCP tool inventory: $tools"
+  [ -x "$PYTHON" ] && [ -f "$CURRENT_LINK/.browser-worker-revision" ] && [ -f "$CURRENT_LINK/mcp-browser-worker/operator_support.py" ] \
+    || die "worker release is missing or predates production bootstrap; run $ROOT_DIR/install.sh"
+  wait_live || die "browser-worker did not become live; inspect $LOG_DIR/browser-worker.log and run scripts/browser-worker start"
+  "$PYTHON" "$CURRENT_LINK/mcp-browser-worker/operator_support.py" browser
+  "$PYTHON" "$CURRENT_LINK/mcp-browser-worker/operator_support.py" verify "$DATA_DIR" "$PORT" \
+    "$(tr -d '\r\n' < "$CURRENT_LINK/.browser-worker-revision")" "$@"
+}
+
+install_failed() {
+  local rc="$1"
+  trap - EXIT
+  set +e
+  echo "Installation failed (exit $rc); no ready/success claim." >&2
+  if [ -n "${preparing_dir:-}" ] && [ -d "$preparing_dir" ]; then
+    case "$preparing_dir" in "$RELEASES_DIR"/.release-*)
+      # Only our unpublished staging directories; do not follow .venv symlinks.
+      find "$preparing_dir" -type d -exec chmod u+w {} +
+      rm -rf "$preparing_dir"
+      ;; esac
+  fi
+  if [ "$activating" = 1 ]; then
+    bootout
+    if [ -n "$previous_link" ]; then
+      local restore
+      restore="$(mktemp "$DEPLOY_ROOT/.restore.XXXXXX")"
+      rm "$restore"
+      ln -s "$previous_link" "$restore"
+      "$BOOTSTRAP_PYTHON" - "$restore" "$CURRENT_LINK" <<'PY'
+import os, sys
+os.replace(sys.argv[1], sys.argv[2])
+PY
+    elif [ -L "$CURRENT_LINK" ]; then
+      rm "$CURRENT_LINK"
+    fi
+    if [ -f "$previous_plist" ]; then cp "$previous_plist" "$PLIST"; else rm -f "$PLIST"; fi
+    if [ "$was_loaded" = 1 ]; then
+      PORT="$previous_port"
+      start && wait_live && echo "Previous worker service restored" >&2
+    fi
+  fi
+  [ -z "$previous_plist" ] || rm -f "$previous_plist"
+  echo "Inspect $LOG_DIR/browser-worker.log and retry: $ROOT_DIR/install.sh" >&2
+  exit "$rc"
 }
 
 install_cmd() {
   local no_start=0
-  [ "${1:-}" = "--no-start" ] && no_start=1
-  require uv; require python3; require curl; require launchctl; require plutil; require tar; require lsof
+  # EXIT runs after Bash unwinds function locals on errexit. Keep rollback
+  # receipts in script-private globals, not function-local variables.
+  previous_link=""; previous_plist=""; was_loaded=0; activating=0
+  previous_port="$INSTALLED_PORT"; preparing_dir=""
+  case "${1:-}" in '') ;; --no-start) no_start=1; shift ;; *) die "usage: install [--no-start]" ;; esac
+  [ $# -eq 0 ] || die "usage: install [--no-start]"
+  require uv; require git; require curl; require launchctl; require plutil; require tar; require lsof
   source_revision
-  ensure_clients
+  ensure_private_dirs
+  [ ! -L "$CURRENT_LINK" ] || previous_link="$(readlink "$CURRENT_LINK")"
+  if [ -f "$PLIST" ]; then
+    previous_plist="$(mktemp "$DEPLOY_ROOT/.previous-plist.XXXXXX")"
+    cp "$PLIST" "$previous_plist"
+  fi
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && was_loaded=1 || true
+  if { [ "$was_loaded" = 0 ] || [ "$PORT" != "$previous_port" ]; } && lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    [ -z "$previous_plist" ] || rm -f "$previous_plist"
+    die "port $PORT is used by another service; choose BROWSER_WORKER_PORT and retry"
+  fi
+  trap 'install_failed $?' EXIT
+  # Prepare dependencies and a real local browser render before touching the
+  # current release or stopping an existing service.
   prepare_release
+  "$RELEASES_DIR/$REVISION/mcp-browser-worker/.venv/bin/python" \
+    "$RELEASES_DIR/$REVISION/mcp-browser-worker/operator_support.py" browser --render
+  ensure_clients
+  activating=1
+  if [ "$no_start" -eq 0 ]; then bootout; wait_port_free; fi
+  select_release
   write_plist
-  if [ "$no_start" -eq 0 ]; then bootout; wait_port_free; start; verify; fi
-  ok "browser-worker installed"
+  if [ "$no_start" -eq 0 ]; then start; verify; fi
+  trap - EXIT
+  [ -z "$previous_plist" ] || rm -f "$previous_plist"
+  if [ "$no_start" = 1 ]; then
+    ok "browser-worker prepared (not started); run scripts/browser-worker start"
+  else
+    ok "browser-worker installed and verified"
+  fi
 }
 
 status() {
@@ -237,15 +356,26 @@ status() {
 }
 
 case "${1:-}" in
+  install) require git; source_revision; bootstrap_python; load_installed_paths ;;
+  start|restart|verify|status|env|check|logs) bootstrap_python; load_installed_paths ;;
+esac
+
+case "${1:-}" in
   install) shift; install_cmd "$@" ;;
-  start) start; wait_live; ok started ;;
+  start) start; verify; ok started ;;
   stop) bootout; ok stopped ;;
-  restart) bootout; wait_port_free; start; wait_live; ok restarted ;;
-  verify) verify ;;
+  restart) bootout; wait_port_free; start; verify; ok restarted ;;
+  verify) shift; verify "$@" ;;
   status) status ;;
   logs) tail "${2:--50}" "$LOG_DIR/browser-worker.log" ;;
-  check) uv sync --project "$MCP_DIR" --locked >/dev/null; (cd "$MCP_DIR" && .venv/bin/ruff check . && .venv/bin/pytest -q tests && .venv/bin/python -m py_compile ./*.py); bash -n "$ROOT_DIR/install.sh" "$0"; git -C "$ROOT_DIR" diff --check ;;
-  env) printf 'ROOT_DIR=%s\nDEPLOY_ROOT=%s\nCURRENT_LINK=%s\nDATA_DIR=%s\nPORT=%s\nLABEL=%s\nLOG_DIR=%s\n' "$ROOT_DIR" "$DEPLOY_ROOT" "$CURRENT_LINK" "$DATA_DIR" "$PORT" "$LABEL" "$LOG_DIR" ;;
+  check) uv sync --project "$MCP_DIR" --locked --python "$BOOTSTRAP_PYTHON" >/dev/null; (cd "$MCP_DIR" && .venv/bin/ruff check . && .venv/bin/pytest -q tests); bash -n "$ROOT_DIR/install.sh" "$0"; git -C "$ROOT_DIR" diff --check ;;
+  env)
+    production_token="$DATA_DIR/tokens/pi-production"
+    if [ -x "$PYTHON" ] && [ -f "$CURRENT_LINK/mcp-browser-worker/operator_support.py" ] && [ -f "$DATA_DIR/clients.json" ]; then
+      production_token="$("$PYTHON" "$CURRENT_LINK/mcp-browser-worker/operator_support.py" token-path "$DATA_DIR")"
+    fi
+    printf 'ROOT_DIR=%s\nDEPLOY_ROOT=%s\nCURRENT_LINK=%s\nDATA_DIR=%s\nPORT=%s\nLABEL=%s\nLOG_DIR=%s\nPRODUCTION_TOKEN_FILE=%s\n' "$ROOT_DIR" "$DEPLOY_ROOT" "$CURRENT_LINK" "$DATA_DIR" "$PORT" "$LABEL" "$LOG_DIR" "$production_token"
+    ;;
   uninstall) bootout; rm -f "$PLIST"; ok "uninstalled; private data retained" ;;
   *) echo "usage: $0 {install [--no-start]|start|stop|restart|verify|status|logs|check|env|uninstall}" >&2; exit 2 ;;
 esac

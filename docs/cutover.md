@@ -1,6 +1,6 @@
 # Atomic Cutover and Rollback
 
-This is a future release runbook. The current state is an unregistered worker plus isolated canaries. Do not execute the production steps until every gate below is green and the user explicitly authorizes production cutover.
+This records the original canary cutover and rollback process. Current standalone installation provisions the Pi production caller and verifies local browser readiness; see the root README for that supported path. Historical canary receipts below are not proof of a new installation. My AI production promotion remains separate: do not execute those steps until its gates are green and the user explicitly authorizes them.
 
 ## Non-negotiable invariant
 

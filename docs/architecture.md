@@ -1,6 +1,6 @@
 # Browser Worker Architecture
 
-Status: implementation contract for the unregistered canary. Production Pi and My AI registrations remain unchanged.
+Status: worker implementation contract. The installer now bootstraps a local Pi production caller; My AI registration/promotion remains a separate, explicitly authorized operation.
 
 ## Boundary
 
@@ -73,10 +73,13 @@ Capability tiers:
 | `inspect.interact` | click/type; form submission still requires `submit=true` |
 | `inspect.script` | page evaluation |
 
-Initial client policy:
+Client policy:
 
-- Pi canary: all capabilities.
-- My AI staging: `fetch`, `inspect.read`, and optionally `inspect.artifact`; no click, type, submit, evaluation, upload, download, or credential APIs.
+- New standalone installs provision `pi-production` with all Pi capabilities and a locally generated private token.
+- Existing callers/tokens/capabilities are preserved. An existing production caller must have `fetch` and `inspect.read`; missing privileges require explicit review, not automatic escalation.
+- Pi canary and My AI clients remain separate identities. My AI staging typically uses `fetch`, `inspect.read`, and optionally `inspect.artifact`; no click, type, submit, evaluation, upload, download, or credential APIs.
+
+Installation provisions matching Chromium and verifies a real local render before selecting/stopping a service. The default operator `verify` checks the browser executable plus revision and authenticated MCP inventory; `verify --smoke` additionally renders a public Example Domain page. Token values stay inside the verifying Python process, not command-line arguments.
 
 Session IDs and artifact IDs are checked against the authenticated caller on every use. Authentication failures are generic and constant-time.
 
