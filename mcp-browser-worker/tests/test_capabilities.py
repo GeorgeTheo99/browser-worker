@@ -17,6 +17,9 @@ async def test_read_only_caller_cannot_interact_script_or_create_artifacts() -> 
             {"action": "evaluate", "session_id": "missing", "script": "1+1"},
             {"action": "screenshot", "session_id": "missing"},
             {"action": "export_pdf", "session_id": "missing"},
+            {"action": "prepare_action", "session_id": "missing", "operation": "click", "selector": "button"},
+            {"action": "execute_prepared", "session_id": "missing", "proposal_id": "opaque"},
+            {"action": "discard_prepared", "session_id": "missing", "proposal_id": "opaque"},
             {"action": "expand_control", "session_id": "missing", "control_id": "opaque"},
             {"action": "select_option", "session_id": "missing", "control_id": "opaque", "option": "All"},
         ]:
@@ -30,5 +33,41 @@ async def test_read_only_caller_cannot_interact_script_or_create_artifacts() -> 
         screenshot = await browser_fetch("https://example.com", include_screenshot=True)
         assert screenshot.is_error
         assert screenshot.structured_content["error"] == "caller capability does not allow this operation"
+    finally:
+        auth._current_caller.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_confirmation_is_not_raw_interaction_or_artifact_authority(monkeypatch):
+    import server
+
+    calls = []
+
+    async def act(owner, session_id, action, **params):
+        calls.append(action)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(server.manager, "act", act)
+    token = auth._current_caller.set(Caller("my-ai", frozenset({"inspect.read", "inspect.confirmed"})))
+    try:
+        for action, fields in [
+            ("click", {"selector": "button"}), ("type", {"selector": "input", "text": "x"}),
+            ("evaluate", {"script": "1"}), ("screenshot", {}), ("export_pdf", {}),
+        ]:
+            assert (await browser_inspect(action, session_id="s", **fields)).structured_content["code"] == "capability_denied"
+        for action, fields in [
+            ("elements", {}), ("prepare_action", {"operation": "click", "selector": "button"}),
+            ("execute_prepared", {"proposal_id": "p"}), ("discard_prepared", {"proposal_id": "p"}),
+        ]:
+            assert (await browser_inspect(action, session_id="s", **fields)).structured_content["status"] == "ok"
+        assert calls == ["elements", "prepare_action", "execute_prepared", "discard_prepared"]
+    finally:
+        auth._current_caller.reset(token)
+    token = auth._current_caller.set(Caller("pi", frozenset({"inspect.read", "inspect.interact", "inspect.script"})))
+    try:
+        for action, fields in [("click", {"selector": "button"}),
+                               ("type", {"selector": "input", "text": "x"}),
+                               ("evaluate", {"script": "1"})]:
+            assert (await browser_inspect(action, session_id="s", **fields)).structured_content["status"] == "ok"
     finally:
         auth._current_caller.reset(token)

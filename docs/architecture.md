@@ -25,7 +25,7 @@ The operator installs a locked environment inside an exact Git-archive release, 
 
 ## Tool contracts
 
-All schemas reject unknown fields. Limits are enforced server-side even if a client bypasses schema validation. Results are JSON serialized into MCP text content and contain no filesystem paths, credentials, cookies, profile data, or raw internal errors.
+All schemas reject unknown fields. Limits are enforced server-side even if a client bypasses schema validation. Results are JSON serialized into MCP text content and contain no worker filesystem paths, cookies, profile data, or raw internal errors. Page content is untrusted and may contain sensitive data. Approval previews deliberately echo the exact caller-supplied text/script/JSON for private human review; clients must not log or expose those previews to the model.
 
 ### `browser_fetch`
 
@@ -50,13 +50,14 @@ Actions:
 
 - Session/lifecycle: `open`, `state`, `close`, `cleanup_scope`
 - Navigation/tabs: `navigate`, `open_tab`, `list_tabs`, `switch_tab`, `close_tab`
-- Read-only inspection: `extract_text`, `extract_links`, `controls`, `wait`, `console`
+- Read-only inspection: `extract_text`, `extract_links`, `controls`, `elements`, `wait`, `console`
 - Restricted research interaction: `expand_control`, `select_option` (explicit `inspect.controls` grant)
 - Artifacts: `screenshot`, `export_pdf`
+- Server-mediated confirmation capability: `prepare_action`, `execute_prepared`, `discard_prepared`
 - Interactive Pi capability: `click`, `type`
 - Privileged Pi-only capability: `evaluate`
 
-Common fields are optional at the JSON-Schema layer for model compatibility and strictly checked per action: `session_id`, `scope_id`, `url`, `selector`, `control_id`, `option`, `text`, `tab_index`, `timeout_ms`, `wait_until`, `state`, `url_contains`, `max_chars`, `limit`, `clear`, `submit`, `full_page`, `format`, `landscape`, `print_background`, `script`, and `arg`.
+Common fields are optional at the JSON-Schema layer for model compatibility and strictly checked per action: `session_id`, `scope_id`, `url`, `selector`, `control_id`, `option`, `text`, `tab_index`, `timeout_ms`, `wait_until`, `state`, `url_contains`, `max_chars`, `limit`, `clear`, `submit`, `full_page`, `format`, `landscape`, `print_background`, `script`, `arg`, `operation`, and `proposal_id`.
 
 `open` creates an isolated ephemeral profile and may navigate to `url`. Every later action requires the opaque `session_id`. Sessions are bound to the authenticated caller, expire after 5 minutes idle or 15 minutes total, and cannot survive a worker restart.
 
@@ -73,11 +74,27 @@ Common fields are optional at the JSON-Schema layer for model compatibility and 
 
 **This is an explicit policy expansion, not read-only browsing or a guarantee of no side effects.** Page click/change handlers can issue public requests, mutate remote state, navigate, or run page code. A handler may already have run before a stale/timeout error is returned; do not blindly retry mutations. Form/credential/access detection is conservative and heuristic, not an authorization boundary. The pinned public-network proxy remains the egress boundary. No caller-provided selector clicking, typing, evaluation, upload, download, or credentials are added by `inspect.controls`.
 
+### Confirmed action contract
+
+`inspect.confirmed` is a trusted client-server capability, **not proof of human consent supplied by the worker**. My AI must expose `elements` to its model, but keep all three approval protocol actions out of its model schema. Its backend prepares the model's requested operation, privately persists the preview, displays it to the user, and calls execution only after an explicit user confirmation. Denial calls discard. Clear private text/script/argument details after every terminal outcome; never automatically retry an execution after an error or lost response. Pi's direct `click`/`type`/`evaluate` grants are unchanged.
+
+- `elements` requires `inspect.read`; optional `limit` defaults to 50 (schema `1..200`, output capped at 100). Returns `{status:"ok",session_id,elements:[{selector,tag,role,label,type,href}],truncated}`. Scans at most 500 main-document interactive candidates. Structural CSS selectors are unique at discovery; labels are at most 500 characters, roles/types 100, selectors 2000, hrefs 8192. Hidden elements and literal private/unsafe hrefs are omitted or blanked. No input values, textarea content, or editable content are read as labels. These are untrusted observations, not durable target IDs.
+- `prepare_action` requires `inspect.read` plus `inspect.confirmed`, `session_id`, and `operation: "click" | "type" | "evaluate"`. Click requires `selector` (1..2000 characters). Type additionally requires `text` (1..20000), with `clear=true` and `submit=false` defaults. Evaluate requires `script` (1..20000) and optional JSON `arg` (default null, serialized UTF-8 capped at 20000 bytes; nonfinite numbers rejected). Optional `timeout_ms` keeps existing `1000..60000` bounds and is frozen. Unrelated command/navigation fields are rejected.
+- Preparation returns `{status:"ok",session_id,proposal_id,expires_in_seconds,preview:{action,url,origin,selector?,target_label?,target_tag?,destination?,default_submitter?,text?,clear?,submit?,script?,arg?}}`. Text/script/arg are the **exact frozen command**, never truncated or redacted in the approval preview. Target labels and destination are observed DOM metadata, not a prediction of site-handler behavior. Destination includes detected links/forms and effective submit actions, including external label-associated controls. For `type(submit=true)`, `default_submitter` discloses the actual first form-associated submit button in document order (including external buttons): `{label,tag,action,method,target,enctype,novalidate}` with effective overrides. Clients must display this submission metadata with the preview.
+- `execute_prepared` and `discard_prepared` accept only `session_id` and `proposal_id` (1..128 characters), besides the action discriminator; no command overrides. Both require `inspect.read` plus `inspect.confirmed`. Successful discard returns `{status:"ok",session_id,discarded:true}`. Successful click/type execution returns `{status:"ok",session_id,url}`; evaluation returns `{status:"ok",session_id,result}` with the existing 50000-character JSON result bound.
+- One in-memory pending proposal per session; preparation replaces/revokes an older proposal. Lifetime is at most 120 seconds, below the 300-second session idle timeout (absolute session TTL still applies). Preparation releases the session lock immediately after returning; no browser operation or lock is held while waiting for UI confirmation. Ownership is inherited from the session; another owner/session cannot use or discard its proposal. Close, cancellation, session expiry, and worker restart destroy proposals.
+- Click/type preparation resolves exactly one visible **main-document** ElementHandle; frame selectors and shadow-tree targets are refused. Execution retains that handle and document, never re-resolves the selector. After a click-free Playwright trial actionability wait, Python rechecks the session epoch and proposal identity, then a single synchronous DOM task rechecks navigation generation, document/root/URL, the bounded DOM signature, node/association identities, a viewport-center hit test, and a browser-monotonic deadline immediately before dispatch. The signature includes default submitter identity and effective overrides; changing or inserting a default button revokes authority. All execution waits are capped by the earlier of command timeout, proposal expiry, and absolute session expiry. Browser clock calibration conservatively subtracts transport delay; even a queued dispatch cannot extend authority. Evaluation also checks retained document/root/URL and the browser deadline in-call.
+- Navigation revocation also lives in the browser: an init script registers main-world native Navigation API `currententrychange` and `pagehide` capture listeners before site scripts. A closure-owned monotonic counter is exposed only through a frozen, nonreplaceable reader; proposal state stays in Patchright's isolated realm. Click/type/evaluate guards compare the retained generation synchronously at dispatch, so `pushState`, `replaceState`, hash changes, and back/forward traversal permanently revoke approval even when the URL is restored after Python's last preflight. State-only history changes also revoke. Native observation covers mutations from either realm and borrowed history methods; later site listeners cannot suppress the earlier capture observer. Documents without Navigation API/current-entry support fail closed (`approval_unavailable`); this relies on the supported Chromium event semantics, not a sandbox against a compromised browser. Existing DOM/document/deadline guards remain in force.
+- **Confirmed actions deliberately use DOM activation, not trusted pointer/keyboard input.** Click calls native `HTMLElement.click()` after the guard (no pointerdown/up or automatic pointer-focus sequence, and no navigation-completion wait). Typing supports only editable native text-like inputs and textareas: native focus, guarded value replacement/append-at-end, then a guarded synthetic `input` event; no per-character key events, selection-aware insertion, or `change` event is synthesized. `submit=true` supports only single-line inputs with a supported, enabled default submit button: after input handlers, it revalidates and natively clicks that button, rather than pressing Enter. The original input is hit-tested; the implicit submitter need not be visible, matching implicit button activation. Missing/disabled/image submitters, dialog submissions, custom editors, file/image controls, and unsupported/oversized targets fail closed. Pi's direct Playwright click/type/Enter semantics remain unchanged.
+- Execution consumes the proposal **before validation or any effect**. Expiration, staleness, errors, cancellation, duplicate calls, or a lost response never make it replayable. Unknown/replaced/used IDs return `approval_unavailable`; a matching expired ID returns `approval_expired`; invalidated document/target returns `approval_stale`. Cross-owner/closed sessions return `invalid_session`. Detectable access-denied/CAPTCHA pages are refused by the existing `check_access` check at discovery, preparation, and execution.
+
+**Approved actions are not transactional or side-effect-free.** Approved clicks allow forms and label activation; `submit=true` requests the bound default submitter activation after typing. Trial actionability can scroll and trigger scroll handlers. Guards run again after focus and input handlers, but cannot roll back those handlers or the value already written. Handlers triggered by an approved dispatch can change destinations, issue public requests, navigate, or mutate targets within that same activation, even past the deadline. DOM guards bind dispatch, not arbitrary handler side effects or the eventual network transaction. Any error/lost response may mean partial execution with an unknown outcome: never automatically replay it. Confirmation grants neither uploads/downloads nor credential/profile APIs; the pinned public-network proxy and download cancellation remain unchanged.
+
 ### Extraction and errors
 
 `extract_text` requires exactly one matching element (default `body`), checks the match count immediately, and bounds extraction to the smaller of `timeout_ms` and 3 seconds. Use `wait` explicitly for late content. `extract_links.selector` targets actual links, e.g. `main a[href]`, not the `main` container; multiple matches are expected. Returned links are visible and syntax-filtered (including literal private IP denial); hostname DNS policy is enforced on navigation, not by resolving every returned link.
 
-Errors use `{"status":"error","code":"...","error":"fixed safe message"}` with MCP `isError=true`. Stable codes: `selector_not_found`, `selector_ambiguous`, `invalid_selector`, `extraction_timeout`, `invalid_session` (also expired/closed/cross-owner), `capability_denied`, `stale_control`, `unsupported_control`, `ambiguous_control`, `blocked_access`, `invalid_request`, `operation_timeout`, `operation_failed`, and `artifact_error`. No exception strings, selectors, option values, paths, or internal driver traces are copied into errors. Successful `close`/`cleanup_scope` retain `status: "closed"`.
+Errors use `{"status":"error","code":"...","error":"fixed safe message"}` with MCP `isError=true`. Stable codes: `selector_not_found`, `selector_ambiguous`, `invalid_selector`, `extraction_timeout`, `invalid_session` (also expired/closed/cross-owner), `capability_denied`, `stale_control`, `unsupported_control`, `ambiguous_control`, `approval_expired`, `approval_stale`, `approval_unavailable`, `blocked_access`, `invalid_request`, `operation_timeout`, `operation_failed`, and `artifact_error`. No exception strings, selectors, option values, paths, or internal driver traces are copied into errors. Successful `close`/`cleanup_scope` retain `status: "closed"`.
 
 ## Caller authentication and capabilities
 
@@ -88,10 +105,11 @@ Capability tiers:
 | Capability | Allows |
 |---|---|
 | `fetch` | `browser_fetch` |
-| `inspect.read` | lifecycle, navigation, tabs, extraction, controls discovery, wait, state, console |
+| `inspect.read` | lifecycle, navigation, tabs, extraction, controls/elements discovery, wait, state, console |
 | `inspect.controls` | restricted dropdown expansion/exact observed-option selection; also requires `inspect.read` |
+| `inspect.confirmed` | prepare/execute/discard a frozen click/type/evaluate command; also requires `inspect.read` and trusted client confirmation mediation |
 | `inspect.artifact` | screenshot/PDF creation and owner-bound retrieval |
-| `inspect.interact` | click/type; form submission still requires `submit=true` |
+| `inspect.interact` | direct click/type; type's extra Enter press requires `submit=true`, but clicks can activate forms |
 | `inspect.script` | page evaluation |
 
 Existing installer/example client policy is unchanged:
@@ -105,7 +123,7 @@ An explicitly approved research client could use the capability list below in it
 ["fetch", "inspect.read", "inspect.controls"]
 ```
 
-The new tier still denies `click`, `type`, `evaluate`, screenshots/PDFs (unless separately granted), upload, download, and credential APIs.
+The controls tier still denies raw `click`, `type`, `evaluate`, screenshots/PDFs (unless separately granted), upload, download, and credential APIs. A separately authorized My AI confirmation backend can be granted `["fetch", "inspect.read", "inspect.controls", "inspect.confirmed", "inspect.artifact"]`: this permits private confirmation mediation and artifacts but still denies raw `click`/`type`/`evaluate`. This implementation does not modify any runtime client policy.
 
 Session IDs and artifact IDs are checked against the authenticated caller on every use. Authentication failures are generic and constant-time.
 
@@ -163,6 +181,7 @@ Callers cannot provide output paths. Screenshots and PDFs are written atomically
 6. Artifacts: traversal, symlink, hardlink/replacement, quota, expiry, MIME, hash, and atomic write checks.
 7. Browser behavior: rendered text, navigation, tabs, waits, screenshots/PDFs, console, interaction, downloads blocked, and no persistent cookies across sessions.
 8. Operator: plist validation, private modes, exact listener/tool inventory, restart and health.
+9. Confirmation: no-effect discovery/preparation, exact frozen text/script/JSON, explicit label submission, discard/expiry/replay, owner/session isolation, target/form/URL/document/tab changes, navigation race guards, cancellation cleanup, unchanged raw/artifact capabilities and public egress.
 
 Network-dependent browser smokes are marked separately; the security suite uses injected resolvers/connectors and local fixtures so private-network denial cannot be disabled in production.
 

@@ -13,6 +13,7 @@ from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from approvals import MAX_ARG_BYTES
 from artifacts import ArtifactError, ArtifactStore
 from auth import ClientRegistry, current_caller
 from browser_runtime import BrowserManager, WorkerError
@@ -44,6 +45,10 @@ InspectAction = Literal[
     "extract_text",
     "extract_links",
     "controls",
+    "elements",
+    "prepare_action",
+    "execute_prepared",
+    "discard_prepared",
     "expand_control",
     "select_option",
     "wait",
@@ -209,12 +214,42 @@ async def browser_inspect(
     print_background: bool = True,
     script: Annotated[str | None, Field(max_length=20_000)] = None,
     arg: Any | None = None,
+    operation: Literal["click", "type", "evaluate"] | None = None,
+    proposal_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
 ) -> ToolResult:
     """Create or operate a short-lived caller-owned browser session using one explicit action."""
     caller = current_caller()
     try:
         caller.require("inspect.read")
         timeout = _bounded_timeout(timeout_ms)
+        if action in {"prepare_action", "execute_prepared", "discard_prepared"}:
+            caller.require("inspect.confirmed")
+        elif operation is not None or proposal_id is not None:
+            raise WorkerError("approval fields are only accepted for approval actions")
+        if action in {"execute_prepared", "discard_prepared"}:
+            if any(value is not None for value in (
+                operation, scope_id, url, selector, control_id, option, text, tab_index,
+                url_contains, script, arg,
+            )) or (timeout_ms, wait_until, state, max_chars, limit, clear, submit, full_page,
+                   format, landscape, print_background) != (
+                       DEFAULT_TIMEOUT_MS, "domcontentloaded", "visible", 20_000, 50, True,
+                       False, True, "A4", False, True,
+                   ):
+                raise WorkerError("terminal approval actions accept only session_id and proposal_id")
+            sid = _bounded_text(session_id, name="session_id", maximum=128, required=True)
+            pid = _bounded_text(proposal_id, name="proposal_id", maximum=128, required=True)
+            return await _safe_call(manager.act(caller.id, sid, action, proposal_id=pid))
+        if action == "prepare_action":
+            if operation not in {"click", "type", "evaluate"} or proposal_id is not None:
+                raise WorkerError("prepare_action requires an operation and no proposal_id")
+            if any(value is not None for value in (scope_id, url, control_id, option, tab_index, url_contains)):
+                raise WorkerError("prepare_action accepts only command fields")
+            if operation != "evaluate" and (script is not None or arg is not None):
+                raise WorkerError("script and arg require evaluate")
+            if operation == "evaluate" and selector is not None:
+                raise WorkerError("evaluate accepts no selector")
+            if operation != "type" and (text is not None or submit or not clear):
+                raise WorkerError("input fields require type")
         if action in {"controls", "expand_control", "select_option"}:
             if action != "controls":
                 caller.require("inspect.controls")
@@ -265,7 +300,22 @@ async def browser_inspect(
             "landscape": bool(landscape),
             "print_background": bool(print_background),
         }
-        if action in {"expand_control", "select_option"}:
+        if action == "prepare_action":
+            params["operation"] = operation
+            if operation in {"click", "type"}:
+                params["selector"] = _bounded_text(selector, name="selector", maximum=2000, required=True)
+                if operation == "type":
+                    params["text"] = _bounded_text(text, name="text", maximum=20_000, required=True)
+            else:
+                params["script"] = _bounded_text(script, name="script", maximum=20_000, required=True)
+                try:
+                    encoded = json.dumps(arg, allow_nan=False)
+                    if len(encoded.encode("utf-8")) > MAX_ARG_BYTES:
+                        raise ValueError("oversized argument")
+                    params["arg"] = json.loads(encoded)
+                except (TypeError, ValueError, RecursionError) as exc:
+                    raise WorkerError("arg must be bounded JSON") from exc
+        elif action in {"expand_control", "select_option"}:
             params["control_id"] = _bounded_text(control_id, name="control_id", maximum=128, required=True)
             if action == "select_option":
                 params["option"] = _bounded_text(option, name="option", maximum=200, required=True)

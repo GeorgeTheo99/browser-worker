@@ -25,6 +25,7 @@ from patchright.async_api import (
 )
 from patchright.async_api import TimeoutError as BrowserTimeoutError
 
+from approvals import NAVIGATION_INIT_SCRIPT, ApprovalStore, discover_elements
 from artifacts import ArtifactStore
 from config import (
     ABSOLUTE_TTL_SECONDS,
@@ -89,6 +90,7 @@ class BrowserSession:
     dispose_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     disposed: bool = False
     controls: ControlStore = field(default_factory=ControlStore)
+    approvals: ApprovalStore = field(default_factory=ApprovalStore)
 
 
 class BrowserManager:
@@ -214,6 +216,7 @@ class BrowserManager:
         context = await self._playwright.chromium.launch_persistent_context(str(profile_dir), **options)
         context.set_default_timeout(DEFAULT_TIMEOUT_MS)
         context.set_default_navigation_timeout(DEFAULT_TIMEOUT_MS)
+        await context.add_init_script(NAVIGATION_INIT_SCRIPT)
         await context.add_init_script(
             """
             (() => {
@@ -229,6 +232,9 @@ class BrowserManager:
         if page in session.tracked_pages:
             return
         session.tracked_pages.add(page)
+        session.approvals.invalidate()
+        page.on("framenavigated", lambda frame: session.approvals.invalidate() if frame == page.main_frame else None)
+        page.on("close", session.approvals.invalidate)
         session.controls.invalidate()
         page.on("framenavigated", lambda frame: session.controls.invalidate() if frame == page.main_frame else None)
         page.on("close", session.controls.invalidate)
@@ -403,6 +409,11 @@ class BrowserManager:
                     return
                 session.disposed = True
                 try:
+                    async with asyncio.timeout(2):
+                        await session.approvals.clear()
+                except Exception as exc:  # noqa: BLE001 - context cleanup must still run
+                    logger.debug("browser approval cleanup failed: %s", type(exc).__name__)
+                try:
                     async with asyncio.timeout(5):
                         await session.context.close()
                 except Exception as exc:  # noqa: BLE001 - cleanup must continue after browser-driver failures
@@ -438,6 +449,7 @@ class BrowserManager:
 
     async def _navigate(self, session: BrowserSession, url: str, *, wait_until: WaitUntil, timeout_ms: int) -> None:
         session.controls.invalidate()
+        session.approvals.invalidate()
         await resolve_public_url(url, session.proxy.resolver)
         page = self._active_page(session)
         navigation = asyncio.create_task(
@@ -521,6 +533,25 @@ class BrowserManager:
                 session.touched_mono = time.monotonic()
                 page = self._active_page(session)
                 timeout_ms = int(params.get("timeout_ms") or DEFAULT_TIMEOUT_MS)
+                if action == "elements":
+                    result = await discover_elements(page, int(params.get("limit") or 50))
+                    return {"status": "ok", "session_id": session.id, **result}
+                if action in {"prepare_action", "execute_prepared", "discard_prepared"} and (
+                    self._sessions.get(session_id) is not session or session.disposed
+                    or time.monotonic() >= session.created_mono + ABSOLUTE_TTL_SECONDS
+                ):
+                    raise fail("invalid_session")
+                if action == "prepare_action":
+                    result = await session.approvals.prepare(
+                        page, params["operation"], params,
+                        session_deadline=session.created_mono + ABSOLUTE_TTL_SECONDS,
+                    )
+                    return {"status": "ok", "session_id": session.id, **result}
+                if action in {"execute_prepared", "discard_prepared"}:
+                    result = await session.approvals.finish(
+                        page, params["proposal_id"], execute=action == "execute_prepared"
+                    )
+                    return {"status": "ok", "session_id": session.id, **result}
                 if action in {"controls", "expand_control", "select_option"}:
                     result = await session.controls.run(
                         page, action, str(params.get("control_id") or ""), params.get("option")
@@ -561,6 +592,7 @@ class BrowserManager:
                     if not 0 <= index < len(pages):
                         raise WorkerError("tab index is out of range")
                     session.controls.invalidate()
+                    session.approvals.invalidate()
                     session.active_index = index
                     await pages[index].bring_to_front()
                     return await self._state(session)
