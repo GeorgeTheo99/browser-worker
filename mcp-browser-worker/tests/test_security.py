@@ -39,6 +39,9 @@ def test_url_shape_rejects_credentials_schemes_and_ports() -> None:
     with pytest.raises(NetworkPolicyError):
         parse_public_url("http://example.com:22/")
     assert parse_public_url("https://example.com/path").hostname == "example.com"
+    for url in ["http://127.0.0.1/", "https://[::1]/", "http://169.254.169.254/"]:
+        with pytest.raises(NetworkPolicyError, match="not public"):
+            parse_public_url(url)
 
 
 @pytest.mark.asyncio

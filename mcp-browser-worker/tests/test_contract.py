@@ -16,7 +16,10 @@ def test_exact_two_tool_inventory_and_closed_schemas() -> None:
     assert by_name["browser_inspect"].parameters["additionalProperties"] is False
     assert by_name["browser_fetch"].parameters["required"] == ["url"]
     actions = by_name["browser_inspect"].parameters["properties"]["action"]["enum"]
-    assert "evaluate" in actions
+    assert {"controls", "expand_control", "select_option", "evaluate"} <= set(actions)
+    properties = by_name["browser_inspect"].parameters["properties"]
+    assert properties["control_id"]["anyOf"][0]["maxLength"] == 128
+    assert properties["option"]["anyOf"][0]["maxLength"] == 200
     assert "upload" not in actions
     assert "download" not in actions
     assert set(by_name) == {"browser_fetch", "browser_inspect"}

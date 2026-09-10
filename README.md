@@ -1,13 +1,13 @@
 # browser-worker
 
-Standalone, loopback-only rendered browser MCP for Pi and My AI canaries.
+Standalone, loopback-only rendered browser MCP for Pi and My AI.
 
 It is intentionally independent of `local_web_search` and exposes exactly:
 
 - `browser_fetch`
 - `browser_inspect`
 
-Production client registration is not part of the initial worker install. See [`docs/architecture.md`](docs/architecture.md) for the security contract and tool schemas, and [`docs/cutover.md`](docs/cutover.md) for the gated atomic cutover/rollback runbook.
+Client registrations and capability grants are operator-managed. `browser_inspect` supports bounded dropdown discovery plus explicitly granted `inspect.controls` expansion/selection; existing client grants are not broadened automatically. Dropdown handlers may issue public requests: this is not a no-side-effects guarantee. See [`docs/architecture.md`](docs/architecture.md) for schemas, safe error codes, and the security contract, and [`docs/cutover.md`](docs/cutover.md) for the historical gated cutover/rollback runbook.
 
 ## Development
 

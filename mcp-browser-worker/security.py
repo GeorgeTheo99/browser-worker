@@ -71,7 +71,13 @@ def parse_public_url(url: str) -> urllib.parse.SplitResult:
         raise NetworkPolicyError("embedded URL credentials are not allowed")
     if not parsed.hostname:
         raise NetworkPolicyError("URL is missing a hostname")
-    normalize_hostname(parsed.hostname)
+    host = normalize_hostname(parsed.hostname)
+    try:
+        literal = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        literal = None
+    if literal is not None and not is_public_ip(str(literal)):
+        raise NetworkPolicyError("destination is not public")
     effective_port = port or (443 if parsed.scheme.lower() == "https" else 80)
     if effective_port not in ALLOWED_DESTINATION_PORTS:
         raise NetworkPolicyError("destination port is not allowed")

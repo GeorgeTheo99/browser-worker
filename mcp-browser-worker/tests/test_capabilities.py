@@ -17,11 +17,14 @@ async def test_read_only_caller_cannot_interact_script_or_create_artifacts() -> 
             {"action": "evaluate", "session_id": "missing", "script": "1+1"},
             {"action": "screenshot", "session_id": "missing"},
             {"action": "export_pdf", "session_id": "missing"},
+            {"action": "expand_control", "session_id": "missing", "control_id": "opaque"},
+            {"action": "select_option", "session_id": "missing", "control_id": "opaque", "option": "All"},
         ]:
             result = await browser_inspect(**kwargs)
             assert result.is_error
             assert result.structured_content == {
                 "status": "error",
+                "code": "capability_denied",
                 "error": "caller capability does not allow this operation",
             }
         screenshot = await browser_fetch("https://example.com", include_screenshot=True)

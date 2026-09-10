@@ -26,6 +26,7 @@ from config import (
     MAX_TEXT_CHARS,
     ROOT_DIR,
 )
+from errors import ERROR_MESSAGES
 from security import NetworkPolicyError
 
 logger = logging.getLogger("browser-worker.mcp")
@@ -42,6 +43,9 @@ InspectAction = Literal[
     "close_tab",
     "extract_text",
     "extract_links",
+    "controls",
+    "expand_control",
+    "select_option",
     "wait",
     "console",
     "screenshot",
@@ -102,8 +106,9 @@ def _json_result(value: dict[str, Any]) -> ToolResult:
     return ToolResult(content=text, structured_content=value)
 
 
-def _error_result(message: str) -> ToolResult:
-    value = {"status": "error", "error": message}
+def _error_result(code: str) -> ToolResult:
+    code = code if code in ERROR_MESSAGES else "operation_failed"
+    value = {"status": "error", "code": code, "error": ERROR_MESSAGES[code]}
     return ToolResult(
         content=json.dumps(value, separators=(",", ":")),
         structured_content=value,
@@ -133,16 +138,20 @@ async def _safe_call(coro: Any, *, total_seconds: float = 90.0) -> ToolResult:
             result = await coro
         return _json_result(result)
     except PermissionError:
-        return _error_result("caller capability does not allow this operation")
-    except (WorkerError, NetworkPolicyError, ArtifactError) as exc:
-        return _error_result(str(exc))
+        return _error_result("capability_denied")
+    except WorkerError as exc:
+        return _error_result(exc.code)
+    except NetworkPolicyError:
+        return _error_result("blocked_access")
+    except ArtifactError:
+        return _error_result("artifact_error")
     except TimeoutError:
-        return _error_result("browser operation exceeded its total deadline")
+        return _error_result("operation_timeout")
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - MCP boundary returns a privacy-safe generic failure
         logger.error("browser operation failed: %s", type(exc).__name__)
-        return _error_result("browser operation failed")
+        return _error_result("operation_failed")
 
 
 @mcp.tool()
@@ -161,7 +170,7 @@ async def browser_fetch(
         if include_screenshot:
             caller.require("inspect.artifact")
     except PermissionError:
-        return _error_result("caller capability does not allow this operation")
+        return _error_result("capability_denied")
     return await _safe_call(
         manager.fetch(
             caller.id,
@@ -182,6 +191,8 @@ async def browser_inspect(
     scope_id: Annotated[str | None, Field(max_length=128)] = None,
     url: Annotated[str | None, Field(max_length=8192)] = None,
     selector: Annotated[str | None, Field(max_length=2000)] = None,
+    control_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
+    option: Annotated[str | None, Field(min_length=1, max_length=200)] = None,
     text: Annotated[str | None, Field(max_length=20_000)] = None,
     tab_index: Annotated[int | None, Field(ge=0, le=100)] = None,
     timeout_ms: Annotated[int, Field(ge=1_000, le=MAX_OPERATION_TIMEOUT_MS)] = DEFAULT_TIMEOUT_MS,
@@ -204,6 +215,17 @@ async def browser_inspect(
     try:
         caller.require("inspect.read")
         timeout = _bounded_timeout(timeout_ms)
+        if action in {"controls", "expand_control", "select_option"}:
+            if action != "controls":
+                caller.require("inspect.controls")
+            if any(value is not None for value in (selector, text, script, arg, url, tab_index, scope_id, url_contains)) or submit:
+                raise WorkerError("dropdown actions accept no selectors, input, scripts, or navigation")
+            if action == "controls" and (control_id is not None or option is not None):
+                raise WorkerError("controls accepts no control_id or option")
+            if action == "expand_control" and option is not None:
+                raise WorkerError("expand_control accepts no option")
+        elif control_id is not None or option is not None:
+            raise WorkerError("dropdown fields are only accepted for dropdown actions")
         if action == "open":
             if session_id is not None:
                 raise WorkerError("session_id is not accepted for open")
@@ -243,7 +265,11 @@ async def browser_inspect(
             "landscape": bool(landscape),
             "print_background": bool(print_background),
         }
-        if action in {"navigate"}:
+        if action in {"expand_control", "select_option"}:
+            params["control_id"] = _bounded_text(control_id, name="control_id", maximum=128, required=True)
+            if action == "select_option":
+                params["option"] = _bounded_text(option, name="option", maximum=200, required=True)
+        elif action in {"navigate"}:
             params["url"] = _bounded_text(url, name="url", maximum=8192, required=True)
         elif action == "open_tab":
             params["url"] = _bounded_text(url, name="url", maximum=8192)
@@ -277,9 +303,9 @@ async def browser_inspect(
             params["arg"] = arg
         return await _safe_call(manager.act(caller.id, sid, action, **params))
     except PermissionError:
-        return _error_result("caller capability does not allow this operation")
-    except WorkerError as exc:
-        return _error_result(str(exc))
+        return _error_result("capability_denied")
+    except WorkerError:
+        return _error_result("invalid_request")
 
 
 @mcp.custom_route("/live", methods=["GET"])

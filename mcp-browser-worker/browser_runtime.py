@@ -20,6 +20,10 @@ from patchright.async_api import (
     Playwright,
     async_playwright,
 )
+from patchright.async_api import (
+    Error as BrowserError,
+)
+from patchright.async_api import TimeoutError as BrowserTimeoutError
 
 from artifacts import ArtifactStore
 from config import (
@@ -43,6 +47,8 @@ from config import (
     VIEWPORT_HEIGHT,
     VIEWPORT_WIDTH,
 )
+from controls import ControlStore, check_access
+from errors import WorkerError, fail
 from security import (
     NetworkPolicyError,
     PublicEgressProxy,
@@ -53,10 +59,6 @@ from security import (
 
 WaitUntil = Literal["load", "domcontentloaded", "networkidle", "commit"]
 logger = logging.getLogger("browser-worker.runtime")
-
-
-class WorkerError(RuntimeError):
-    pass
 
 
 def chromium_hardening_args() -> list[str]:
@@ -86,6 +88,7 @@ class BrowserSession:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     dispose_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     disposed: bool = False
+    controls: ControlStore = field(default_factory=ControlStore)
 
 
 class BrowserManager:
@@ -226,6 +229,9 @@ class BrowserManager:
         if page in session.tracked_pages:
             return
         session.tracked_pages.add(page)
+        session.controls.invalidate()
+        page.on("framenavigated", lambda frame: session.controls.invalidate() if frame == page.main_frame else None)
+        page.on("close", session.controls.invalidate)
 
         def on_console(message: ConsoleMessage) -> None:
             try:
@@ -330,7 +336,7 @@ class BrowserManager:
         async with self._state_lock:
             session = self._sessions.get(session_id)
         if session is None or session.owner != owner:
-            raise WorkerError("browser session not found")
+            raise WorkerError("browser session not found", code="invalid_session")
         return session
 
     async def cleanup_scope(self, owner: str, scope_id: str) -> dict[str, object]:
@@ -353,7 +359,7 @@ class BrowserManager:
         async with self._state_lock:
             session = self._sessions.get(session_id)
             if session is None or session.owner != owner:
-                raise WorkerError("browser session not found")
+                raise WorkerError("browser session not found", code="invalid_session")
 
         async def evict_and_dispose() -> None:
             async with self._state_lock:
@@ -431,6 +437,7 @@ class BrowserManager:
         return pages[session.active_index]
 
     async def _navigate(self, session: BrowserSession, url: str, *, wait_until: WaitUntil, timeout_ms: int) -> None:
+        session.controls.invalidate()
         await resolve_public_url(url, session.proxy.resolver)
         page = self._active_page(session)
         navigation = asyncio.create_task(
@@ -445,7 +452,7 @@ class BrowserManager:
             await asyncio.gather(navigation, return_exceptions=True)
             raise
         except NetworkPolicyError as exc:
-            raise WorkerError("browser navigation was blocked by public-network policy") from exc
+            raise WorkerError("browser navigation was blocked by public-network policy", code="blocked_access") from exc
         except Exception as exc:
             raise WorkerError("browser navigation failed") from exc
         session.touched_mono = time.monotonic()
@@ -514,6 +521,11 @@ class BrowserManager:
                 session.touched_mono = time.monotonic()
                 page = self._active_page(session)
                 timeout_ms = int(params.get("timeout_ms") or DEFAULT_TIMEOUT_MS)
+                if action in {"controls", "expand_control", "select_option"}:
+                    result = await session.controls.run(
+                        page, action, str(params.get("control_id") or ""), params.get("option")
+                    )
+                    return {"status": "ok", "session_id": session.id, **result}
                 if action == "state":
                     return await self._state(session)
                 if action == "navigate":
@@ -548,11 +560,12 @@ class BrowserManager:
                     pages = self._pages(session)
                     if not 0 <= index < len(pages):
                         raise WorkerError("tab index is out of range")
+                    session.controls.invalidate()
                     session.active_index = index
                     await pages[index].bring_to_front()
                     return await self._state(session)
                 if action == "close_tab":
-                    index = int(params.get("tab_index", session.active_index))
+                    index = int(params["tab_index"] if params.get("tab_index") is not None else session.active_index)
                     pages = self._pages(session)
                     if not 0 <= index < len(pages):
                         raise WorkerError("tab index is out of range")
@@ -563,18 +576,22 @@ class BrowserManager:
                     selector = params.get("selector")
                     max_chars = min(MAX_TEXT_CHARS, int(params.get("max_chars") or 20_000))
                     try:
-                        if selector:
-                            text = await page.locator(str(selector)).evaluate(
+                        async with asyncio.timeout(min(timeout_ms, 3000) / 1000):
+                            await check_access(page)
+                            locator = page.locator(str(selector or "body"))
+                            count = await locator.count()
+                            if count == 0:
+                                raise fail("selector_not_found")
+                            if count > 1:
+                                raise fail("selector_ambiguous")
+                            text = await locator.evaluate(
                                 "(el, limit) => (el.innerText || el.textContent || '').slice(0, limit + 1)",
-                                max_chars,
+                                max_chars, timeout=min(timeout_ms, 3000),
                             )
-                        else:
-                            text = await page.locator("body").evaluate(
-                                "(el, limit) => (el.innerText || el.textContent || '').slice(0, limit + 1)",
-                                max_chars,
-                            )
-                    except Exception as exc:
-                        raise WorkerError("text extraction failed") from exc
+                    except (TimeoutError, BrowserTimeoutError) as exc:
+                        raise fail("extraction_timeout") from exc
+                    except BrowserError as exc:
+                        raise fail("invalid_selector") from exc
                     return {
                         "status": "ok",
                         "session_id": session.id,
@@ -587,12 +604,19 @@ class BrowserManager:
                     selector = str(params.get("selector") or "a[href]")
                     limit = min(MAX_LINKS, int(params.get("limit") or 50))
                     try:
-                        raw = await page.locator(selector).evaluate_all(
-                            "(els, limit) => els.slice(0, limit).map(el => ({text:(el.innerText||el.textContent||'').trim(), url:el.href||''}))",
-                            min(400, limit * 4),
-                        )
-                    except Exception as exc:
-                        raise WorkerError("link extraction failed") from exc
+                        async with asyncio.timeout(min(timeout_ms, 3000) / 1000):
+                            await check_access(page)
+                            locator = page.locator(selector)
+                            if await locator.count() == 0:
+                                raise fail("selector_not_found")
+                            raw = await locator.evaluate_all(
+                                "(els, limit) => els.filter(el => el.matches('a[href]') && el.checkVisibility()).slice(0, limit).map(el => ({text:(el.innerText||el.textContent||'').trim().slice(0,500), url:el.href.slice(0,8192)}))",
+                                min(400, limit * 4),
+                            )
+                    except (TimeoutError, BrowserTimeoutError) as exc:
+                        raise fail("extraction_timeout") from exc
+                    except BrowserError as exc:
+                        raise fail("invalid_selector") from exc
                     links: list[dict[str, str]] = []
                     for row in raw if isinstance(raw, list) else []:
                         if not isinstance(row, dict):
