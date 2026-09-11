@@ -327,8 +327,17 @@ async def test_safe_exception_boundary_and_extraction_timeout(monkeypatch):
             raise BrowserTimeoutError("SECRET browser trace")
 
     class Page:
-        async def evaluate(self, _script):
+        parent_frame = None
+
+        @property
+        def main_frame(self):
+            return self
+
+        def is_detached(self):
             return False
+
+        async def evaluate(self, script):
+            return 'https://public.test/' if script == 'location.href' else False
 
         def locator(self, _selector):
             return Locator()

@@ -16,6 +16,7 @@ from typing import Any, Literal
 from patchright.async_api import (
     BrowserContext,
     ConsoleMessage,
+    ElementHandle,
     Page,
     Playwright,
     async_playwright,
@@ -25,7 +26,7 @@ from patchright.async_api import (
 )
 from patchright.async_api import TimeoutError as BrowserTimeoutError
 
-from approvals import NAVIGATION_INIT_SCRIPT, ApprovalStore, discover_elements
+from approvals import ApprovalStore, discover_elements
 from artifacts import ArtifactStore
 from config import (
     ABSOLUTE_TTL_SECONDS,
@@ -48,8 +49,9 @@ from config import (
     VIEWPORT_HEIGHT,
     VIEWPORT_WIDTH,
 )
-from controls import ControlStore, check_access
+from controls import ControlStore
 from errors import WorkerError, fail
+from frames import FRAME_ACTIONS, NAVIGATION_INIT_SCRIPT, FrameStore, check_frame_access
 from security import (
     NetworkPolicyError,
     PublicEgressProxy,
@@ -91,6 +93,7 @@ class BrowserSession:
     disposed: bool = False
     controls: ControlStore = field(default_factory=ControlStore)
     approvals: ApprovalStore = field(default_factory=ApprovalStore)
+    frames: FrameStore = field(default_factory=FrameStore)
 
 
 class BrowserManager:
@@ -235,6 +238,8 @@ class BrowserManager:
         session.approvals.invalidate()
         page.on("framenavigated", lambda frame: session.approvals.invalidate() if frame == page.main_frame else None)
         page.on("close", session.approvals.invalidate)
+        page.on("framenavigated", session.frames.invalidate)
+        page.on("framedetached", session.frames.invalidate)
         session.controls.invalidate()
         page.on("framenavigated", lambda frame: session.controls.invalidate() if frame == page.main_frame else None)
         page.on("close", session.controls.invalidate)
@@ -411,6 +416,7 @@ class BrowserManager:
                 try:
                     async with asyncio.timeout(2):
                         await session.approvals.clear()
+                        await session.frames.clear()
                 except Exception as exc:  # noqa: BLE001 - context cleanup must still run
                     logger.debug("browser approval cleanup failed: %s", type(exc).__name__)
                 try:
@@ -510,6 +516,15 @@ class BrowserManager:
         if width < 1 or height < 1 or height > MAX_CAPTURE_HEIGHT or width * height > MAX_CAPTURE_PIXELS:
             raise WorkerError("page is too large for a bounded artifact capture")
 
+    @staticmethod
+    async def _no_upload(element: ElementHandle) -> None:
+        if await element.evaluate('''el => {
+          for (let n = el; n; n = n.parentElement || n.getRootNode().host)
+            if (n.matches('input[type="file"]') || n.control?.matches('input[type="file"]')) return true;
+          return !!el.querySelector('input[type="file"]');
+        }'''):
+            raise fail('approval_unavailable')
+
     async def act(self, owner: str, session_id: str, action: str, **params: Any) -> dict[str, object]:
         try:
             return await self._act_impl(owner, session_id, action, **params)
@@ -525,6 +540,8 @@ class BrowserManager:
             raise
 
     async def _act_impl(self, owner: str, session_id: str, action: str, **params: Any) -> dict[str, object]:
+        if params.get("frame_id") is not None and action not in FRAME_ACTIONS:
+            raise fail("invalid_request")
         if action == "close":
             return await self.close(owner, session_id)
         async with self.operation():
@@ -533,8 +550,17 @@ class BrowserManager:
                 session.touched_mono = time.monotonic()
                 page = self._active_page(session)
                 timeout_ms = int(params.get("timeout_ms") or DEFAULT_TIMEOUT_MS)
+                frame = page.main_frame
+                if params.get("frame_id") is not None:
+                    async with asyncio.timeout(min(timeout_ms, 3000) / 1000):
+                        frame = await session.frames.resolve(page, params["frame_id"])
+                if action == "frames":
+                    async with asyncio.timeout(min(timeout_ms, 3000) / 1000):
+                        result = await session.frames.discover(page, int(params.get("limit") or 50))
+                    return {"status": "ok", "session_id": session.id, **result}
                 if action == "elements":
-                    result = await discover_elements(page, int(params.get("limit") or 50))
+                    await check_frame_access(page, frame)
+                    result = await discover_elements(frame, int(params.get("limit") or 50))
                     return {"status": "ok", "session_id": session.id, **result}
                 if action in {"prepare_action", "execute_prepared", "discard_prepared"} and (
                     self._sessions.get(session_id) is not session or session.disposed
@@ -543,9 +569,15 @@ class BrowserManager:
                     raise fail("invalid_session")
                 if action == "prepare_action":
                     result = await session.approvals.prepare(
-                        page, params["operation"], params,
+                        page, params["operation"], params, frame=frame,
                         session_deadline=session.created_mono + ABSOLUTE_TTL_SECONDS,
                     )
+                    if params.get("frame_id") is not None:
+                        try:
+                            await session.frames.resolve(page, params["frame_id"])
+                        except BaseException:
+                            await session.approvals.clear()
+                            raise
                     return {"status": "ok", "session_id": session.id, **result}
                 if action in {"execute_prepared", "discard_prepared"}:
                     result = await session.approvals.finish(
@@ -609,17 +641,27 @@ class BrowserManager:
                     max_chars = min(MAX_TEXT_CHARS, int(params.get("max_chars") or 20_000))
                     try:
                         async with asyncio.timeout(min(timeout_ms, 3000) / 1000):
-                            await check_access(page)
-                            locator = page.locator(str(selector or "body"))
+                            await check_frame_access(page, frame)
+                            locator = frame.locator(str(selector or "body"))
                             count = await locator.count()
                             if count == 0:
                                 raise fail("selector_not_found")
                             if count > 1:
                                 raise fail("selector_ambiguous")
-                            text = await locator.evaluate(
-                                "(el, limit) => (el.innerText || el.textContent || '').slice(0, limit + 1)",
-                                max_chars, timeout=min(timeout_ms, 3000),
-                            )
+                            element = await locator.element_handle(timeout=min(timeout_ms, 3000))
+                            if element is None:
+                                raise fail("selector_not_found")
+                            try:
+                                if await element.owner_frame() != frame:
+                                    raise fail("invalid_selector")
+                                # Read the retained checked-document target, never
+                                # re-resolve a selector into an unchecked child.
+                                observation = await element.evaluate(
+                                    "(el, limit) => { if (!el.isConnected || el.ownerDocument !== document) throw new Error('stale target'); return {text:(el.innerText || el.textContent || '').slice(0, limit + 1), url:location.href, title:document.title.slice(0,500)}; }",
+                                    max_chars,
+                                )
+                            finally:
+                                await element.dispose()
                     except (TimeoutError, BrowserTimeoutError) as exc:
                         raise fail("extraction_timeout") from exc
                     except BrowserError as exc:
@@ -627,24 +669,31 @@ class BrowserManager:
                     return {
                         "status": "ok",
                         "session_id": session.id,
-                        "url": page.url,
-                        "title": (await page.title())[:500],
-                        "text": str(text)[:max_chars],
-                        "truncated": len(str(text)) > max_chars,
+                        "url": observation["url"],
+                        "title": observation["title"],
+                        "text": str(observation["text"])[:max_chars],
+                        "truncated": len(str(observation["text"])) > max_chars,
                     }
                 if action == "extract_links":
                     selector = str(params.get("selector") or "a[href]")
                     limit = min(MAX_LINKS, int(params.get("limit") or 50))
                     try:
                         async with asyncio.timeout(min(timeout_ms, 3000) / 1000):
-                            await check_access(page)
-                            locator = page.locator(selector)
+                            await check_frame_access(page, frame)
+                            locator = frame.locator(selector)
                             if await locator.count() == 0:
                                 raise fail("selector_not_found")
-                            raw = await locator.evaluate_all(
-                                "(els, limit) => els.filter(el => el.matches('a[href]') && el.checkVisibility()).slice(0, limit).map(el => ({text:(el.innerText||el.textContent||'').trim().slice(0,500), url:el.href.slice(0,8192)}))",
-                                min(400, limit * 4),
-                            )
+                            document = await frame.evaluate_handle("document")
+                            try:
+                                # A single retained document authority keeps the
+                                # batch in the checked realm, even if the selector
+                                # enters a child. Never materialize N remote handles.
+                                raw = await locator.evaluate_all(
+                                    "(els,args) => { if (document !== args.document || !els.every(el => el.isConnected && el.ownerDocument === args.document)) throw new Error('wrong document'); return els.filter(el => el.matches('a[href]') && el.checkVisibility()).slice(0, args.limit).map(el => ({text:(el.innerText||el.textContent||'').trim().slice(0,500), url:el.href.slice(0,8192)})); }",
+                                    {"document": document, "limit": min(400, limit * 4)},
+                                )
+                            finally:
+                                await document.dispose()
                     except (TimeoutError, BrowserTimeoutError) as exc:
                         raise fail("extraction_timeout") from exc
                     except BrowserError as exc:
@@ -663,41 +712,64 @@ class BrowserManager:
                     return {"status": "ok", "session_id": session.id, "links": links}
                 if action == "click":
                     try:
-                        await page.locator(str(params["selector"])).click(timeout=timeout_ms)
+                        await check_frame_access(page, frame)
+                        element = await frame.locator(str(params["selector"])).element_handle(timeout=timeout_ms)
+                        if element is None:
+                            raise fail("selector_not_found")
+                        try:
+                            if await element.owner_frame() != frame:
+                                raise fail("invalid_request")
+                            await self._no_upload(element)
+                            await element.click(timeout=timeout_ms)
+                        finally:
+                            await element.dispose()
                     except Exception as exc:
                         raise WorkerError("click failed") from exc
                     return await self._state(session)
                 if action == "type":
-                    locator = page.locator(str(params["selector"]))
+                    element = None
                     try:
+                        await check_frame_access(page, frame)
+                        element = await frame.locator(str(params["selector"])).element_handle(timeout=timeout_ms)
+                        if element is None:
+                            raise fail("selector_not_found")
+                        if await element.owner_frame() != frame:
+                            raise fail("invalid_request")
+                        await self._no_upload(element)
                         if params.get("clear", True):
-                            await locator.fill(str(params["text"]), timeout=timeout_ms)
+                            await element.fill(str(params["text"]), timeout=timeout_ms)
                         else:
-                            await locator.press_sequentially(str(params["text"]), timeout=timeout_ms)
+                            await element.type(str(params["text"]), timeout=timeout_ms)
                         if params.get("submit", False):
-                            await locator.press("Enter", timeout=timeout_ms)
+                            await check_frame_access(page, frame)
+                            await element.press("Enter", timeout=timeout_ms)
                     except Exception as exc:
                         raise WorkerError("typing failed") from exc
-                    return {"status": "ok", "session_id": session.id, "url": page.url}
+                    finally:
+                        if element is not None:
+                            await element.dispose()
+                    return {"status": "ok", "session_id": session.id, "url": frame.url}
                 if action == "wait":
+                    await check_frame_access(page, frame)
                     selector = params.get("selector")
                     url_contains = params.get("url_contains")
                     if selector:
                         try:
-                            await page.locator(str(selector)).wait_for(
+                            await frame.locator(str(selector)).wait_for(
                                 state=params.get("state", "visible"), timeout=timeout_ms
                             )
                         except Exception as exc:
                             raise WorkerError("wait condition was not met") from exc
                     elif url_contains:
-                        deadline = time.monotonic() + timeout_ms / 1000
-                        while str(url_contains) not in page.url:
-                            if time.monotonic() >= deadline:
-                                raise WorkerError("wait condition was not met")
-                            await asyncio.sleep(0.05)
+                        try:
+                            await frame.wait_for_function(
+                                "part => location.href.includes(part)", arg=str(url_contains), timeout=timeout_ms,
+                            )
+                        except Exception as exc:
+                            raise WorkerError("wait condition was not met") from exc
                     else:
                         try:
-                            await page.wait_for_load_state(params.get("wait_until", "domcontentloaded"), timeout=timeout_ms)
+                            await frame.wait_for_load_state(params.get("wait_until", "domcontentloaded"), timeout=timeout_ms)
                         except Exception as exc:
                             raise WorkerError("wait condition was not met") from exc
                     return await self._state(session)
@@ -726,7 +798,8 @@ class BrowserManager:
                     return {"status": "ok", "session_id": session.id, "events": session.console[-limit:]}
                 if action == "evaluate":
                     try:
-                        result = await page.evaluate(str(params["script"]), params.get("arg"))
+                        await check_frame_access(page, frame)
+                        result = await frame.evaluate(str(params["script"]), params.get("arg"))
                         encoded = json.dumps(result, allow_nan=False)
                         if len(encoded) > MAX_TEXT_CHARS:
                             raise ValueError("evaluation result is too large")

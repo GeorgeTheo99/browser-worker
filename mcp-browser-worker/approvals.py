@@ -9,38 +9,23 @@ import asyncio
 import json
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from patchright.async_api import ElementHandle, Error, JSHandle, Page
+from patchright.async_api import ElementHandle, Error, Frame, JSHandle, Page
 from patchright.async_api import TimeoutError as BrowserTimeoutError
 
 from controls import check_access
 from errors import fail
+from frames import DocumentRef, ancestry, check_frame_access
 from security import NetworkPolicyError, parse_public_url
 
 APPROVAL_TTL_SECONDS = 120
 MAX_ARG_BYTES = 20_000
 
-# Installed in the main world before site scripts. Native currententrychange is
-# synchronous for History API mutations (also from other realms) and traversals.
-# Unlike history wrappers, it cannot be bypassed with a borrowed native method.
-# Only a frozen reader is exposed; the counter and listener stay in a closure.
-# Capture registration precedes site listeners, so stopImmediatePropagation
-# cannot hide changes. Unsupported documents fail closed during preparation.
-NAVIGATION_INIT_SCRIPT = r"""(function () {
-  const nav = this.navigation;
-  if (!nav || !nav.currentEntry) return;
-  let generation = 0n;
-  const revoke = () => { generation++; };
-  nav.addEventListener('currententrychange', revoke, true);
-  // Leaving a document must also revoke a retained/BFCache-restored realm.
-  this.addEventListener('pagehide', revoke, true);
-  Object.defineProperty(this, '__browserWorkerNavigationGeneration', {
-    value: Object.freeze(() => generation), writable: false, configurable: false
-  });
-})();"""
+NATIVE_WARNING = ('Native effects may change after preflight; errors may follow partial effects. '
+                  'Never retry automatically.')
 
 # Never read input values, textarea content, or editable content as labels. Refuse
 # oversized signatures instead of silently comparing truncated identity fields.
@@ -53,7 +38,7 @@ const text = el => {
     acceptNode: n => n.nodeType === 1 && n.matches('input,textarea,select,script,style,[contenteditable]:not([contenteditable="false"])') ?
       NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
   });
-  if (el.matches('input,textarea,select,[contenteditable]:not([contenteditable="false"])')) return '';
+  if (el.isContentEditable || el.matches('input,textarea,select,[contenteditable]:not([contenteditable="false"])')) return '';
   let result = '', n, count = 0;
   while ((n = walker.nextNode()) && count++ < 200 && result.length < 501)
     if (n.nodeType === 3) result += n.textContent;
@@ -68,37 +53,33 @@ const label = el => el.getAttribute('aria-label') ||
 
 _SNAPSHOT = r"""(el, command = {}) => {
 """ + _DOM_HELPERS + r"""
-  if (!(el instanceof HTMLElement) || window !== window.top || el.ownerDocument !== document || el.getRootNode() !== document ||
+  if (!(el instanceof Element) || el.ownerDocument !== document ||
       !visible(el) || el.matches(':disabled,[aria-disabled="true"]')) return null;
-  if (command.action === 'type' && (!el.matches('input,textarea') || el.readOnly ||
-      (el.tagName === 'INPUT' && !['text','search','tel','url','email','password'].includes(el.type)))) return null;
-  if (command.action === 'click' && !el.closest('a[href],button,input,label,[role="button"],[role="link"]')) return null;
-  // Enter's default submitter is the first submit button in document order,
-  // including external form-associated buttons. No-button/image/custom flows
-  // are deliberately unsupported rather than guessed.
+  if (command.action === 'type' && (!(el.matches('input,textarea') || el.isContentEditable) || el.readOnly)) return null;
+  // Disclose a known implicit submitter when present, without substituting its
+  // activation for real Enter or restricting custom keyboard handlers.
   let defaultSubmitter = null, submission = null;
-  if (command.action === 'type' && command.submit) {
-    if (el.tagName !== 'INPUT' || !el.form) return null;
-    const candidates = document.querySelectorAll('button,input');
+  if (command.action === 'type' && command.submit && el.tagName === 'INPUT' && el.form) {
+    const candidates = el.getRootNode().querySelectorAll('button,input');
     if (candidates.length > 500) return null;
     defaultSubmitter = [...candidates].find(n =>
       n.form === el.form && ['submit','image'].includes(n.type));
-    if (!defaultSubmitter || defaultSubmitter.type === 'image' ||
-        defaultSubmitter.matches(':disabled,[aria-disabled="true"]')) return null;
-    const f = el.form, s = defaultSubmitter;
-    submission = {label: label(s), tag: s.tagName.toLowerCase(),
-      action: s.hasAttribute('formaction') ? s.formAction : f.action,
-      method: s.hasAttribute('formmethod') ? s.formMethod : f.method,
-      target: s.hasAttribute('formtarget') ? s.formTarget : f.target,
-      enctype: s.hasAttribute('formenctype') ? s.formEnctype : f.enctype,
-      novalidate: s.formNoValidate || f.noValidate};
-    if (!['get','post'].includes(submission.method)) return null;
+    if (defaultSubmitter) {
+      const f = el.form, s = defaultSubmitter;
+      submission = {label: label(s), tag: s.tagName.toLowerCase(),
+        action: s.hasAttribute('formaction') ? s.formAction : f.action,
+        method: s.hasAttribute('formmethod') ? s.formMethod : f.method,
+        target: s.hasAttribute('formtarget') ? s.formTarget : f.target,
+        enctype: s.hasAttribute('formenctype') ? s.formEnctype : f.enctype,
+        novalidate: s.formNoValidate || f.noValidate};
+    }
   }
   const nodes = [el], associations = defaultSubmitter ? [defaultSubmitter] : [];
-  for (let p = el.parentElement; p; p = p.parentElement) {
+  const parent = n => n.parentElement || n.getRootNode().host;
+  for (let p = parent(el); p; p = parent(p)) {
     nodes.push(p); if (nodes.length > 32) return null;
   }
-  const descendants = el.querySelectorAll('*');
+  const descendants = command.action === 'type' && el.isContentEditable ? [] : el.querySelectorAll('*');
   if (descendants.length > 100) return null;
   nodes.push(...descendants);
   // Include activation through labels (including external submitters), links,
@@ -113,7 +94,7 @@ _SNAPSHOT = r"""(el, command = {}) => {
   }
   for (const n of [...associations]) if (n.form) associations.push(n.form);
   if (associations.length > 100 || [...nodes, ...associations].some(n =>
-      n.matches('input[type="file"],input[type="image"],select,option'))) return null;
+      n.matches('input[type="file"]'))) return null;
   const attrs = ['id','role','type','href','target','download','form','action','method','for',
     'formaction','formmethod','formtarget','formenctype','formnovalidate','enctype','novalidate',
     'aria-label','aria-labelledby','aria-disabled','disabled','readonly','contenteditable','name'];
@@ -142,13 +123,13 @@ _SNAPSHOT = r"""(el, command = {}) => {
   return {document, root: document.documentElement, url: location.href, command,
     element: el, associations, nodes, signature, defaultSubmitter,
     info: {target_label: targetLabel, target_tag: el.tagName.toLowerCase(), destination: destination || null,
+      ...(command.action === 'type' ? {target_contenteditable: !!el.isContentEditable} : {}),
       ...(submission ? {default_submitter: submission} : {})}};
 }"""
 
-# Trial actionability may wait arbitrarily while the page changes. It grants no
-# authority: inspect, hit-test, deadline and DOM dispatch share one synchronous
-# task below, with another guard after every handler-producing operation.
-_GUARDED_ACTION = r"""(saved, args) => {
+# Trial actionability may wait while the page changes. This read-only guard is
+# deliberately separate from native dispatch: no atomic/exact-effect guarantee.
+_PREFLIGHT = r"""(saved, args) => {
   const inspect = """ + _SNAPSHOT + r""";
   const el = saved.element;
   const guard = () => {
@@ -163,32 +144,11 @@ _GUARDED_ACTION = r"""(saved, args) => {
     const r = el.getBoundingClientRect();
     const left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
     const top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
-    const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
+    const hit = el.getRootNode().elementFromPoint((left + right) / 2, (top + bottom) / 2);
     if (right <= left || bottom <= top || !hit || (hit !== el && !el.contains(hit))) return 'approval_stale';
     return performance.now() >= args.deadline ? 'approval_expired' : null;
   };
-  let error = guard();
-  if (error) return {error};
-  if (saved.command.action === 'click') {
-    HTMLElement.prototype.click.call(el);
-  } else {
-    HTMLElement.prototype.focus.call(el);
-    error = guard(); // focus handlers may change the approved target or form
-    if (error) return {error};
-    const prototype = el.tagName === 'INPUT' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
-    const value = args.command.clear ? args.command.text : el.value + args.command.text;
-    Object.getOwnPropertyDescriptor(prototype, 'value').set.call(el, value);
-    error = guard();
-    if (error) return {error};
-    el.dispatchEvent(new InputEvent('input', {bubbles: true, composed: true,
-      inputType: 'insertText', data: args.command.text}));
-    if (saved.command.submit) {
-      error = guard(); // input handlers can change default submitter/overrides
-      if (error) return {error};
-      HTMLElement.prototype.click.call(saved.defaultSubmitter);
-    }
-  }
-  return {};
+  return {error: guard()};
 }"""
 
 _ELEMENTS = r"""limit => {
@@ -218,7 +178,7 @@ _ELEMENTS = r"""limit => {
 }"""
 
 
-async def discover_elements(page: Page, limit: int) -> dict[str, Any]:
+async def discover_elements(page: Page | Frame, limit: int) -> dict[str, Any]:
     try:
         async with asyncio.timeout(3):
             await check_access(page)
@@ -248,10 +208,17 @@ class Proposal:
     element: ElementHandle | None = None
     snapshot: JSHandle | None = None
     browser_clock_offset: float = 0
+    documents: list[DocumentRef] = field(default_factory=list)
+
+    @property
+    def frame(self) -> Frame:
+        return self.documents[-1].frame
 
     async def dispose(self) -> None:
         self.command.clear()
-        for handle in (self.snapshot, self.element, self.document):
+        for document in self.documents:
+            await document.dispose()
+        for handle in (self.snapshot, self.element):
             if handle is not None:
                 try:
                     await handle.dispose()
@@ -272,13 +239,14 @@ class ApprovalStore:
         if pending:
             await pending.dispose()
 
-    async def prepare(self, page: Page, operation: str, params: dict[str, Any], *, session_deadline: float | None = None) -> dict[str, Any]:
+    async def prepare(self, page: Page, operation: str, params: dict[str, Any], *, frame: Frame | None = None, session_deadline: float | None = None) -> dict[str, Any]:
         await self.clear()  # one pending proposal per session; replacements revoke old IDs
         proposal = None
-        navigation = None
+        documents: list[DocumentRef] = []
+        frame = frame or page.main_frame
         try:
             async with asyncio.timeout(min(3, APPROVAL_TTL_SECONDS, max(0, (session_deadline or float('inf')) - time.monotonic()))):
-                await check_access(page)
+                await check_frame_access(page, frame)
                 url, epoch = page.url, self.epoch
                 parse_public_url(url)
                 command = {'action': operation, 'timeout_ms': params['timeout_ms']}
@@ -293,14 +261,15 @@ class ApprovalStore:
                     command.update(script=params['script'], arg=json.loads(encoded))
                 else:
                     raise fail('invalid_request')
+                if params.get('frame_id') is not None:
+                    command['frame_id'] = params['frame_id']
                 expires = min(time.monotonic() + APPROVAL_TTL_SECONDS, session_deadline or float('inf'))
                 # Patchright defaults to an isolated realm. Retain the main-world
                 # reader, but keep all proposal authority in the isolated realm.
-                navigation = await page.evaluate_handle(
-                    'function () { return this.__browserWorkerNavigationGeneration; }', isolated_context=False)
+                for current in ancestry(frame):
+                    documents.append(await DocumentRef.capture(current, require_navigation=True))
                 proposal = Proposal(secrets.token_urlsafe(24), page, url, epoch,
-                                    expires, command,
-                                    await page.evaluate_handle('navigation => ({navigation, generation: navigation(), document, root: document.documentElement, url: location.href, clock: performance.now()})', navigation))
+                                    expires, command, documents[-1].handle, documents=documents)
                 clock = await proposal.document.evaluate('d => d.clock')
                 # Subtract the entire clock-sampling round trip: transport delay
                 # can shorten authority, never extend it in the browser realm.
@@ -308,15 +277,20 @@ class ApprovalStore:
                 parts = urlsplit(url)
                 preview = {k: v for k, v in command.items() if k != 'timeout_ms'}
                 preview.update(url=url, origin=f'{parts.scheme}://{parts.netloc}')
+                if params.get('frame_id') is not None:
+                    preview.update(frame_url=documents[-1].url, frame_origin=documents[-1].origin,
+                                   frame_ancestry=[{'url': d.url, 'origin': d.origin} for d in documents[:-1]])
                 if operation in {'click', 'type'}:
-                    locator = page.locator(command['selector'])
+                    preview.update(interaction_mode='native', warning=NATIVE_WARNING)
+                if operation in {'click', 'type'}:
+                    locator = frame.locator(command['selector'])
                     count = await locator.count()
                     if count != 1:
                         raise fail('selector_not_found' if count == 0 else 'selector_ambiguous')
                     proposal.element = await locator.element_handle(timeout=1000)
                     if proposal.element is None:
                         raise fail('selector_not_found')
-                    if await proposal.element.owner_frame() != page.main_frame:
+                    if await proposal.element.owner_frame() != frame:
                         raise fail('approval_unavailable')
                     proposal.snapshot = await proposal.element.evaluate_handle(r"""(el, args) => {
                       const inspect = """ + _SNAPSHOT + r""";
@@ -328,6 +302,7 @@ class ApprovalStore:
                     if info is None:
                         raise fail('approval_unavailable')
                     preview.update({k: v for k, v in info.items() if v is not None})
+                await check_frame_access(page, frame)
                 if not await self._valid(proposal, page):
                     raise fail('approval_stale')
                 if time.monotonic() >= proposal.expires:
@@ -343,19 +318,20 @@ class ApprovalStore:
         except Error as exc:
             raise fail('approval_unavailable') from exc
         finally:
-            if navigation is not None:
-                try:
-                    await navigation.dispose()
-                except Error:
-                    pass
             if proposal is not None and self.pending is not proposal:
                 await proposal.dispose()
+            elif proposal is None:
+                for document in documents:
+                    await document.dispose()
 
     async def _valid(self, proposal: Proposal, page: Page) -> bool:
         if page is not proposal.page or page.is_closed() or self.epoch != proposal.epoch or page.url != proposal.url:
             return False
-        if not await proposal.document.evaluate('d => d.navigation() === d.generation && d.document === document && d.root === document.documentElement'):
+        if ancestry(proposal.frame) != [d.frame for d in proposal.documents]:
             return False
+        for document in proposal.documents:
+            if not await document.valid():
+                return False
         if proposal.snapshot is not None:
             return await proposal.snapshot.evaluate(r"""saved => {
               const inspect = """ + _SNAPSHOT + r""";
@@ -382,8 +358,8 @@ class ApprovalStore:
             async with asyncio.timeout(max(0, stop_at - time.monotonic())):
                 if not await self._valid(proposal, page):
                     raise fail('approval_stale')
-                await check_access(page)
-                # Preflight only; the authoritative guard runs at DOM dispatch.
+                await check_frame_access(page, proposal.frame)
+                # Native operations remain separate from this preflight.
                 if not await self._valid(proposal, page):
                     raise fail('approval_stale')
                 command, element = proposal.command, proposal.element
@@ -391,11 +367,31 @@ class ApprovalStore:
                 if command['action'] in {'click', 'type'}:
                     assert element is not None and proposal.snapshot is not None
                     await element.click(trial=True, timeout=max(1, (stop_at - time.monotonic()) * 1000))
-                    if not await self._valid(proposal, page):
-                        raise fail('approval_stale')
-                    outcome = await proposal.snapshot.evaluate(_GUARDED_ACTION, {'command': command, 'deadline': deadline})
-                    if outcome.get('error'):
-                        raise fail(outcome['error'])
+                    async def preflight() -> None:
+                        await check_frame_access(page, proposal.frame)
+                        if not await self._valid(proposal, page):
+                            raise fail('approval_stale')
+                        outcome = await proposal.snapshot.evaluate(_PREFLIGHT, {'deadline': deadline})
+                        if outcome.get('error'):
+                            raise fail(outcome['error'])
+                        if time.monotonic() >= stop_at:
+                            raise fail('approval_expired')
+
+                    await preflight()  # after the potentially waiting trial
+                    def remaining() -> float:
+                        return max(1, (stop_at - time.monotonic()) * 1000)
+                    if command['action'] == 'click':
+                        await element.click(timeout=remaining())
+                    else:
+                        if command['clear']:
+                            await element.fill(command['text'], timeout=remaining())
+                        else:
+                            await element.type(command['text'], timeout=remaining())
+                        if command['submit']:
+                            # Input/focus/keyboard handlers may already have had
+                            # effects. Check again before a distinct Enter call.
+                            await preflight()
+                            await element.press('Enter', timeout=remaining())
                 else:
                     # Execute in the retained document's realm, with an in-call
                     # identity guard. Page.evaluate could race navigation and run
@@ -418,9 +414,9 @@ class ApprovalStore:
                     }""", {'script': command['script'], 'arg': command['arg'], 'deadline': deadline})
                     if len(json.dumps(result, allow_nan=False)) > 50_000:
                         raise fail('operation_failed')
-                    await check_access(page)
+                    await check_frame_access(page, proposal.frame)
                     return {'result': result}
-                await check_access(page)
+                await check_frame_access(page, proposal.frame)
                 return {'url': page.url}
         except (TimeoutError, BrowserTimeoutError) as exc:
             raise fail('operation_timeout') from exc

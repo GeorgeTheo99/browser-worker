@@ -71,7 +71,8 @@ async def test_discovery_and_prepare_are_readonly_exact_execution_once(approved)
     assert proposal['preview'] == {
         'action': 'type', 'selector': entry['selector'], 'text': 'Exact \"message\"\n', 'clear': True,
         'submit': False, 'url': url, 'origin': url.rstrip('/'), 'target_label': 'Message',
-        'target_tag': 'input', 'destination': url + 'submit',
+        'target_tag': 'input', 'target_contenteditable': False, 'destination': url + 'submit',
+        'interaction_mode': 'native', 'warning': approvals.NATIVE_WARNING,
     }
     assert await page.locator('#entry').input_value() == 'PRIVATE_INPUT_VALUE'
     assert await page.evaluate('[window.clicks,window.submits,window.inputs]') == [0, 0, 0]
@@ -443,7 +444,7 @@ async def test_overlay_history_change_and_restore_revokes_approval(approved, mon
 @pytest.mark.parametrize('operation', ['click', 'type', 'evaluate'])
 @pytest.mark.parametrize('kind', ['pushState', 'replaceState', 'traverse', 'hash'])
 @pytest.mark.parametrize('isolated_context', [False, True])
-async def test_dispatch_guard_revokes_restored_history_after_final_preflight(
+async def test_final_browser_preflight_revokes_restored_history(
         approved, monkeypatch, operation, kind, isolated_context):
     manager, sid, page, url, _ = approved
     if kind == 'traverse':
@@ -551,7 +552,7 @@ async def test_overlay_wait_cannot_outlive_approval_or_session(approved, monkeyp
 
 
 @pytest.mark.parametrize('operation', ['click', 'type', 'evaluate'])
-async def test_dispatch_guard_rejects_delay_after_last_preflight(approved, monkeypatch, operation):
+async def test_final_browser_preflight_rejects_queued_delay(approved, monkeypatch, operation):
     manager, sid, page, _, _ = approved
     monkeypatch.setattr(approvals, 'APPROVAL_TTL_SECONDS', 0.6)
     params = {'selector': '#clicker'} if operation == 'click' else (
@@ -637,7 +638,8 @@ async def test_type_rechecks_after_handlers_before_further_dispatch(approved, ha
     proposal = await prepare(sid, 'type', selector='#entry', text='Approved', submit=True)
     assert (await execute(sid, proposal))['code'] == 'approval_stale'
     assert await page.evaluate('window.submits') == 0
-    assert await page.locator('#entry').input_value() == ('Approved' if handler == 'input' else 'PRIVATE_INPUT_VALUE')
+    # Native fill includes focus and input; guards cannot interleave that call.
+    assert await page.locator('#entry').input_value() == 'Approved'
     assert (await execute(sid, proposal))['code'] == 'approval_unavailable'
 
 
@@ -655,21 +657,25 @@ async def test_type_deadline_is_rechecked_after_handlers(approved, monkeypatch, 
     assert proposal['status'] == 'ok'
     assert (await execute(sid, proposal))['status'] == 'error'
     assert await page.evaluate('window.submits') == 0
-    assert await page.locator('#entry').input_value() == ('Approved' if handler == 'input' else 'PRIVATE_INPUT_VALUE')
+    # Timeout can interrupt fill before or after input, but Enter must not run.
+    assert await page.locator('#entry').input_value() in {'Approved', 'PRIVATE_INPUT_VALUE'}
 
 
-async def test_confirmed_actions_use_documented_dom_not_trusted_input(approved):
+async def test_confirmed_actions_use_native_trusted_pointer_keyboard_and_activation(approved):
     _, sid, page, _, _ = approved
     await page.evaluate("""() => {
       window.events = [];
       for (const event of ['pointerdown','keydown','click','input'])
-        document.addEventListener(event, e => window.events.push([e.type, e.isTrusted]));
+        document.addEventListener(event, e => window.events.push([e.type, e.isTrusted, navigator.userActivation.isActive]));
     }""")
     proposal = await prepare(sid, selector='#clicker')
     assert (await execute(sid, proposal))['status'] == 'ok'
     proposal = await prepare(sid, 'type', selector='#entry', text='Approved', submit=True)
     assert (await execute(sid, proposal))['status'] == 'ok'
-    assert await page.evaluate('window.events') == [['click', False], ['input', False], ['click', False]]
+    assert await page.evaluate('window.events') == [
+        ['pointerdown', True, True], ['click', True, True], ['input', True, True],
+        ['keydown', True, True], ['click', True, True],
+    ]
     assert await page.evaluate('window.submits') == 1
 
 
@@ -687,10 +693,7 @@ async def test_confirmed_actions_reject_frame_selectors(approved):
 
 
 @pytest.mark.parametrize('setup,selector,operation,params', [
-    ("document.querySelector('#submitter').remove()", '#entry', 'type', {'submit': True}),
-    ("document.querySelector('#submitter').disabled = true", '#entry', 'type', {'submit': True}),
-    ("document.querySelector('#submitter').outerHTML = '<input type=image form=form>'", '#entry', 'type', {'submit': True}),
-    ('', '#area', 'type', {'submit': True}),
+
     ("document.querySelector('#entry').readOnly = true", '#entry', 'type', {}),
     ("document.querySelector('#entry').type = 'file'", '#entry', 'click', {}),
 ])

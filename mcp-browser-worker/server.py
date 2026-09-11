@@ -28,6 +28,7 @@ from config import (
     ROOT_DIR,
 )
 from errors import ERROR_MESSAGES
+from frames import FRAME_ACTIONS
 from security import NetworkPolicyError
 
 logger = logging.getLogger("browser-worker.mcp")
@@ -46,6 +47,7 @@ InspectAction = Literal[
     "extract_links",
     "controls",
     "elements",
+    "frames",
     "prepare_action",
     "execute_prepared",
     "discard_prepared",
@@ -196,6 +198,7 @@ async def browser_inspect(
     scope_id: Annotated[str | None, Field(max_length=128)] = None,
     url: Annotated[str | None, Field(max_length=8192)] = None,
     selector: Annotated[str | None, Field(max_length=2000)] = None,
+    frame_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
     control_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
     option: Annotated[str | None, Field(min_length=1, max_length=200)] = None,
     text: Annotated[str | None, Field(max_length=20_000)] = None,
@@ -222,6 +225,10 @@ async def browser_inspect(
     try:
         caller.require("inspect.read")
         timeout = _bounded_timeout(timeout_ms)
+        if frame_id is not None and action not in FRAME_ACTIONS:
+            raise WorkerError("frame_id is unsupported for this action")
+        if frame_id is not None:
+            _bounded_text(frame_id, name="frame_id", maximum=128, required=True)
         if action in {"prepare_action", "execute_prepared", "discard_prepared"}:
             caller.require("inspect.confirmed")
         elif operation is not None or proposal_id is not None:
@@ -300,6 +307,8 @@ async def browser_inspect(
             "landscape": bool(landscape),
             "print_background": bool(print_background),
         }
+        if frame_id is not None:
+            params["frame_id"] = frame_id
         if action == "prepare_action":
             params["operation"] = operation
             if operation in {"click", "type"}:

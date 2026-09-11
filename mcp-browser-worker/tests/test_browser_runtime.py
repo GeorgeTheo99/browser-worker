@@ -16,7 +16,7 @@ class BrowserFixtureResolver(PublicResolver):
         self.port = port
 
     async def resolve(self, hostname: str, port: int) -> ResolvedTarget:
-        if hostname == "public.test" and port == self.port:
+        if hostname in {"public.test", "other-public.test"} and port == self.port:
             return ResolvedTarget(hostname, port, ("127.0.0.1",))
         return await super().resolve(hostname, port)
 

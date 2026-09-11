@@ -10,7 +10,7 @@ import secrets
 from dataclasses import dataclass
 from typing import Any
 
-from patchright.async_api import ElementHandle, Error, Page
+from patchright.async_api import ElementHandle, Error, Frame, Page
 from patchright.async_api import TimeoutError as BrowserTimeoutError
 
 from errors import WorkerError, fail
@@ -84,7 +84,7 @@ _BLOCKED = r"""() => {
 }"""
 
 
-async def check_access(page: Page) -> None:
+async def check_access(page: Page | Frame) -> None:
     if await page.evaluate(_BLOCKED):
         raise fail("blocked_access")
 

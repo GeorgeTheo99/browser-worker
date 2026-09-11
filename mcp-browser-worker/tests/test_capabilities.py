@@ -71,3 +71,27 @@ async def test_confirmation_is_not_raw_interaction_or_artifact_authority(monkeyp
             assert (await browser_inspect(action, session_id="s", **fields)).structured_content["status"] == "ok"
     finally:
         auth._current_caller.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_frame_id_rejected_not_ignored_on_unsupported_actions(monkeypatch):
+    from typing import get_args
+
+    import server
+    from frames import FRAME_ACTIONS
+
+    async def never_called(*args, **kwargs):
+        pytest.fail('invalid frame_id must be rejected before runtime')
+
+    monkeypatch.setattr(server.manager, 'act', never_called)
+    monkeypatch.setattr(server.manager, 'open', never_called)
+    monkeypatch.setattr(server.manager, 'cleanup_scope', never_called)
+    token = auth._current_caller.set(Caller('research', frozenset({'inspect.read', 'inspect.confirmed'})))
+    try:
+        for action in set(get_args(server.InspectAction)) - FRAME_ACTIONS:
+            result = await browser_inspect(action, session_id='s', frame_id='f')
+            assert result.structured_content['code'] == 'invalid_request', action
+        for fid in ['', 'x' * 129]:
+            assert (await browser_inspect('elements', session_id='s', frame_id=fid)).structured_content['code'] == 'invalid_request'
+    finally:
+        auth._current_caller.reset(token)
