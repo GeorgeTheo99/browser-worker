@@ -134,6 +134,7 @@ def test_install_no_start_provisions_production_token_and_browser_idempotently(
     assert token.read_bytes() == before
     assert log.read_text().count("provision-browser") == 2
     assert "ambient-python" not in first.stderr
+    assert not (home / "srv/browser-worker/current").resolve().stat().st_mode & 0o222
 
 
 def test_preparation_failure_preserves_previous_release_and_service(installation):
@@ -204,6 +205,10 @@ def test_interruption_after_final_release_rename_is_recoverable(installation):
     executable(
         fakebin / "mv",
         """#!/bin/sh
+# Enforce the macOS rename precondition on every platform, including Linux CI.
+case "$1" in */.release-*)
+  "$TEST_PYTHON" -c 'import os,sys; assert os.stat(sys.argv[1]).st_mode & 0o200' "$1" || exit 10 ;;
+esac
 /bin/mv "$@" || exit $?
 case "$1" in */.release-*) [ "${INTERRUPT_AFTER_RENAME:-0}" != 1 ] || exit 9 ;; esac
 """,
@@ -218,6 +223,21 @@ case "$1" in */.release-*) [ "${INTERRUPT_AFTER_RENAME:-0}" != 1 ] || exit 9 ;; 
     retry = run(installation, "install", "--no-start")
     assert retry.returncode == 0, retry.stdout + retry.stderr
     assert (home / "srv/browser-worker/current").is_symlink()
+    assert not release.stat().st_mode & 0o222
+
+
+def test_release_symlink_is_rejected_without_chmod_of_target(installation):
+    repo, home, _, _ = installation
+    target = home / "unrelated"
+    target.mkdir(mode=0o700)
+    release = home / "srv/browser-worker/releases" / git(repo, "rev-parse", "HEAD")
+    release.parent.parent.mkdir(parents=True, mode=0o700)
+    release.parent.mkdir(mode=0o700)
+    release.symlink_to(target, target_is_directory=True)
+    result = run(installation, "install", "--no-start")
+    assert result.returncode != 0
+    assert "refusing symlinked release" in result.stderr
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
 
 
 def test_dangling_log_symlink_is_rejected_without_creating_target(installation):

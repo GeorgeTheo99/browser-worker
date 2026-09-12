@@ -162,6 +162,7 @@ PY
 
 prepare_release() {
   local release="$RELEASES_DIR/$REVISION" tmp link_tmp
+  [ ! -L "$release" ] || die "refusing symlinked release directory: $release"
   if [ ! -d "$release" ]; then
     tmp="$(mktemp -d "$RELEASES_DIR/.release-$REVISION.XXXXXX")"
     preparing_dir="$tmp"
@@ -174,10 +175,15 @@ prepare_release() {
     # Finalize and verify privately before the atomic rename. An interruption
     # after rename must leave a complete reusable release, not a poisoned cache.
     chmod -R a-w "$tmp"
+    # macOS requires owner-write on the directory being renamed. Payload
+    # files stay sealed; only the private staging root is writable for mv.
+    chmod u+w "$tmp"
     verify_release "$tmp" "$REVISION"
     mv "$tmp" "$release"
     preparing_dir=""
   fi
+  # Also seal the root when recovering an interruption immediately after mv.
+  chmod a-w "$release"
   verify_release "$release" "$REVISION" \
     || die "existing release failed integrity verification; preserve active state and restore/rebuild $release before retrying"
   [ "$(tr -d '\r\n' < "$release/.browser-worker-revision")" = "$REVISION" ] \
