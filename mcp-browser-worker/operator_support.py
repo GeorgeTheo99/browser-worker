@@ -149,13 +149,13 @@ async def browser_check(render: bool) -> None:
                 opened = await manager.open(
                     "installer", None, wait_until="domcontentloaded", timeout_ms=10_000
                 )
-                result = await manager.act(
-                    "installer",
-                    str(opened["session_id"]),
-                    "evaluate",
-                    script="() => { document.body.textContent = 'BROWSER_WORKER_READY'; return document.body.innerText; }",
+                # Caller evaluation is refused on a top-level blank page by the
+                # frame-access policy, so operator code renders on it directly.
+                session = await manager._get("installer", str(opened["session_id"]))
+                rendered = await manager._active_page(session).evaluate(
+                    "() => { document.body.textContent = 'BROWSER_WORKER_READY'; return document.body.innerText; }"
                 )
-                if result.get("result") != "BROWSER_WORKER_READY":
+                if rendered != "BROWSER_WORKER_READY":
                     raise ValueError(
                         "browser did not render the local installation check"
                     )

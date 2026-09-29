@@ -181,3 +181,9 @@ def test_verify_fails_on_wrong_service_or_authentication(
     monkeypatch.setattr(operator, "request", request)
     with pytest.raises(ValueError):
         operator.verify(tmp_path, 19890, "revision", smoke=False)
+
+
+@pytest.mark.browser
+async def test_browser_render_check_launches_real_browser(capsys):
+    await operator.browser_check(render=True)
+    assert "Browser launch/render verified" in capsys.readouterr().out
