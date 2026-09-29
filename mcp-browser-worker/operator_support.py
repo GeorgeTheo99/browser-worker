@@ -273,9 +273,8 @@ def verify(data: Path, port: int, revision: str, smoke: bool) -> None:
             if item.get("type") == "text"
         )
         rendered = json.loads(text)
-        if rendered.get("status") != "ok" or "Example Domain" not in rendered.get(
-            "text", ""
-        ):
+        # The page body no longer repeats its heading; the title is stable.
+        if rendered.get("status") != "ok" or rendered.get("title") != "Example Domain":
             raise ValueError(
                 "public browser smoke returned no expected rendered content"
             )

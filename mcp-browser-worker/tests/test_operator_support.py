@@ -147,7 +147,13 @@ def test_verify_checks_auth_revision_inventory_and_smoke_without_logging_secret(
                 "content": [
                     {
                         "type": "text",
-                        "text": json.dumps({"status": "ok", "text": "Example Domain"}),
+                        "text": json.dumps(
+                            {
+                                "status": "ok",
+                                "title": "Example Domain",
+                                "text": "This domain is for use in documentation examples.",
+                            }
+                        ),
                     }
                 ]
             },
