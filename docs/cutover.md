@@ -1,6 +1,6 @@
 # Atomic Cutover and Rollback
 
-This is the historical initial-release runbook, not a receipt of current deployment or registration state. Do not execute production steps until every gate below is green and the user explicitly authorizes production cutover. New `inspect.controls` grants require separate explicit policy approval; the original read-only client examples below remain unchanged.
+This records the original canary cutover and rollback process. Current standalone installation provisions the Pi production caller and verifies local browser readiness; see the root README for that supported path. Historical canary receipts below are not proof of a new installation. My AI production promotion remains separate: do not execute those steps until its gates are green and the user explicitly authorizes them. New `inspect.controls` grants require separate explicit policy approval; the original read-only client examples below remain unchanged.
 
 ## Non-negotiable invariant
 

@@ -1,6 +1,6 @@
 # Browser Worker Architecture
 
-Status: worker implementation contract. Client registrations and capability grants are separately operator-managed; the historical canary runbook is not a statement of current deployment state.
+Status: worker implementation contract. The installer bootstraps a local Pi production caller; other client registrations, capability grants, and My AI registration/promotion remain separately operator-managed, explicitly authorized operations. The historical canary runbook is not a statement of current deployment state.
 
 ## Boundary
 
@@ -120,10 +120,11 @@ Capability tiers:
 | `inspect.interact` | direct click/type; type's extra Enter press requires `submit=true`, but clicks can activate forms |
 | `inspect.script` | page evaluation |
 
-Existing installer/example client policy is unchanged:
+Client policy:
 
-- Pi canary: `fetch`, `inspect.read`, `inspect.artifact`, `inspect.interact`, `inspect.script` (not automatically granted `inspect.controls`).
-- My AI staging: `fetch`, `inspect.read`; no mutation grant.
+- New standalone installs provision `pi-production` with `fetch`, `inspect.read`, `inspect.artifact`, `inspect.interact`, and `inspect.script` (not automatically granted `inspect.controls` or `inspect.confirmed`) and a locally generated private token.
+- Existing callers/tokens/capabilities are preserved. An existing production caller must have `fetch` and `inspect.read`; missing privileges require explicit review, not automatic escalation.
+- Pi canary and My AI clients remain separate identities. My AI staging typically uses `fetch`, `inspect.read`, and optionally `inspect.artifact`; no click, type, submit, evaluation, upload, download, or credential APIs.
 
 An explicitly approved research client could use the capability list below in its private client configuration. This is an example, **not** an instruction to broaden existing Pi/My AI clients or tokens:
 
@@ -131,7 +132,9 @@ An explicitly approved research client could use the capability list below in it
 ["fetch", "inspect.read", "inspect.controls"]
 ```
 
-The controls tier still denies raw `click`, `type`, `evaluate`, screenshots/PDFs (unless separately granted), upload, download, and credential APIs. A separately authorized My AI confirmation backend can be granted `["fetch", "inspect.read", "inspect.controls", "inspect.confirmed", "inspect.artifact"]`: this permits private confirmation mediation and artifacts but still denies raw `click`/`type`/`evaluate`. This implementation does not modify any runtime client policy.
+The controls tier still denies raw `click`, `type`, `evaluate`, screenshots/PDFs (unless separately granted), upload, download, and credential APIs. A separately authorized My AI confirmation backend can be granted `["fetch", "inspect.read", "inspect.controls", "inspect.confirmed", "inspect.artifact"]`: this permits private confirmation mediation and artifacts but still denies raw `click`/`type`/`evaluate`. These tiers do not modify any existing runtime client policy.
+
+Installation provisions matching Chromium and verifies a real local render before selecting/stopping a service. The default operator `verify` checks the browser executable plus revision and authenticated MCP inventory; `verify --smoke` additionally renders a public Example Domain page. Token values stay inside the verifying Python process, not command-line arguments.
 
 Session IDs and artifact IDs are checked against the authenticated caller on every use. Authentication failures are generic and constant-time.
 
