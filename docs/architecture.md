@@ -126,7 +126,7 @@ Capability tiers:
 | `inspect.controls` | restricted dropdown expansion/exact observed-option selection; also requires `inspect.read` |
 | `inspect.confirmed` | prepare/execute/discard a frozen click/type/evaluate command; also requires `inspect.read` and trusted client confirmation mediation |
 | `inspect.artifact` | screenshot/PDF creation and owner-bound retrieval |
-| `inspect.interact` | direct click/type; type's extra Enter press requires `submit=true`, but clicks can activate forms |
+| `inspect.interact` | direct click/type; type's extra Enter press requires `submit=true`, but clicks can activate forms; type results disclose `target_contenteditable` so clients can taint typed page prose |
 | `inspect.script` | page evaluation |
 | `inspect.persistent` | `open` with a durable named `profile` |
 | `inspect.download` | accept page downloads as artifacts; `downloads` listing |

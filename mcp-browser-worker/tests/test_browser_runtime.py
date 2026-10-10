@@ -95,7 +95,8 @@ async def test_ephemeral_rendered_session_and_private_subresource_block(
         assert "dynamic text" in str(extracted["text"])
         assert not any(" /private " in request for request in requests)
 
-        await manager.act("owner", session_id, "type", selector="#value", text="Changed title")
+        typed = await manager.act("owner", session_id, "type", selector="#value", text="Changed title")
+        assert typed["target_contenteditable"] is False
         await manager.act("owner", session_id, "click", selector="#apply")
         changed = await manager.act("owner", session_id, "extract_text", selector="h1")
         assert changed["text"] == "Changed title"

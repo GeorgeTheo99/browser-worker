@@ -1057,6 +1057,7 @@ class BrowserManager:
                     return await self._state(session)
                 if action == "type":
                     element = None
+                    editable = True
                     try:
                         await check_frame_access(page, frame)
                         element = await frame.locator(str(params["selector"])).element_handle(timeout=timeout_ms)
@@ -1065,6 +1066,8 @@ class BrowserManager:
                         if await element.owner_frame() != frame:
                             raise fail("invalid_request")
                         await self._no_upload(element)
+                        # Disclose contenteditable targets: typed prose there is page content, not input.
+                        editable = bool(await element.evaluate("el => el.isContentEditable"))
                         if params.get("clear", True):
                             await element.fill(str(params["text"]), timeout=timeout_ms)
                         else:
@@ -1077,7 +1080,7 @@ class BrowserManager:
                     finally:
                         if element is not None:
                             await element.dispose()
-                    return {"status": "ok", "session_id": session.id, "url": frame.url}
+                    return {"status": "ok", "session_id": session.id, "url": frame.url, "target_contenteditable": editable}
                 if action == "wait":
                     await check_frame_access(page, frame)
                     selector = params.get("selector")
