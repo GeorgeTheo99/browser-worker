@@ -12,7 +12,18 @@ from typing import Any
 from starlette.responses import JSONResponse
 
 VALID_CAPABILITIES = frozenset(
-    {"fetch", "inspect.read", "inspect.controls", "inspect.confirmed", "inspect.artifact", "inspect.interact", "inspect.script"}
+    {
+        "fetch",
+        "inspect.read",
+        "inspect.controls",
+        "inspect.confirmed",
+        "inspect.artifact",
+        "inspect.interact",
+        "inspect.script",
+        "inspect.persistent",
+        "inspect.download",
+        "inspect.live",
+    }
 )
 
 

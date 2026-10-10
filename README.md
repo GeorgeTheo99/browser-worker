@@ -4,7 +4,7 @@ Standalone, loopback-only rendered browser MCP for Pi and My AI. It is independe
 `local_web_search` and of the Databricks web-search service, and exposes exactly:
 
 - `browser_fetch` — one-shot rendered page retrieval
-- `browser_inspect` — short-lived caller-owned browser sessions/actions
+- `browser_inspect` — caller-owned browser sessions/actions (ephemeral, or a durable named profile with downloads and a live, human-controllable view for explicitly granted callers)
 
 Client registrations and capability grants are operator-managed. `browser_inspect` supports bounded dropdown discovery plus explicitly granted `inspect.controls` expansion/selection; existing client grants are not broadened automatically. A separate `inspect.confirmed` grant supports server-mediated, single-use human confirmation for frozen click/type/evaluate commands, with read-only `elements` discovery. The client backend must keep approval protocol actions out of its model schema and enforce explicit user consent; the worker does not itself authenticate a human approval. Pi's raw interaction/script grants and the separate artifact grant are unchanged. Page handlers may issue public requests: this is not a no-side-effects guarantee. See [`docs/architecture.md`](docs/architecture.md) for schemas, safe error codes, and the security contract, and [`docs/cutover.md`](docs/cutover.md) for the historical gated cutover/rollback runbook.
 

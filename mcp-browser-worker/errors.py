@@ -18,6 +18,7 @@ ERROR_MESSAGES = {
     "ambiguous_control": "dropdown or option is ambiguous",
     "blocked_access": "page access is blocked; do not attempt to bypass the restriction",
     "artifact_error": "browser artifact is unavailable",
+    "session_busy": "browser session is busy; try again shortly",
 }
 
 

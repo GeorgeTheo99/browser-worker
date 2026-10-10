@@ -26,15 +26,19 @@ class ArtifactRecord:
     sha256: str
     created_at: float
     expires_at: float
+    name: str | None = None
 
     def public(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "artifact_id": self.id,
             "mime_type": self.mime_type,
             "size": self.size,
             "sha256": self.sha256,
             "expires_in_seconds": max(0, int(self.expires_at - time.time())),
         }
+        if self.name is not None:
+            value["filename"] = self.name
+        return value
 
 
 class ArtifactStore:
@@ -81,10 +85,11 @@ class ArtifactStore:
         suffix: str,
         mime_type: str,
         max_bytes: int,
+        name: str | None = None,
     ) -> ArtifactRecord:
         if not data or len(data) > max_bytes:
             raise ArtifactError("artifact exceeds its size limit")
-        if suffix not in {"png", "pdf"}:
+        if suffix not in {"png", "pdf", "download"}:
             raise ArtifactError("artifact type is not allowed")
         await self.sweep()
         async with self._lock:
@@ -113,6 +118,7 @@ class ArtifactStore:
                 hashlib.sha256(data).hexdigest(),
                 now,
                 now + ARTIFACT_TTL_SECONDS,
+                name,
             )
             self._records[artifact_id] = record
             return record

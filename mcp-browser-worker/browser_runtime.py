@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import mimetypes
 import os
+import re
 import secrets
 import shutil
 import stat
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +20,7 @@ from typing import Any, Literal
 from patchright.async_api import (
     BrowserContext,
     ConsoleMessage,
+    Download,
     ElementHandle,
     Page,
     Playwright,
@@ -32,6 +37,7 @@ from config import (
     ABSOLUTE_TTL_SECONDS,
     BROWSER_EXECUTABLE,
     DEFAULT_TIMEOUT_MS,
+    DOWNLOAD_DEADLINE_SECONDS,
     HEADLESS,
     IDLE_TTL_SECONDS,
     MAX_ADMITTED_OPERATIONS,
@@ -39,12 +45,18 @@ from config import (
     MAX_CAPTURE_HEIGHT,
     MAX_CAPTURE_PIXELS,
     MAX_CONCURRENT_OPERATIONS,
+    MAX_DOWNLOAD_BYTES,
     MAX_GLOBAL_SESSIONS,
     MAX_LINKS,
+    MAX_LIVE_VIEWERS_PER_SESSION,
     MAX_PDF_BYTES,
     MAX_SCREENSHOT_BYTES,
+    MAX_SESSION_DOWNLOADS,
     MAX_TABS_PER_SESSION,
     MAX_TEXT_CHARS,
+    PERSISTENT_ABSOLUTE_TTL_SECONDS,
+    PERSISTENT_IDLE_TTL_SECONDS,
+    PROFILES_DIR,
     SESSIONS_DIR,
     VIEWPORT_HEIGHT,
     VIEWPORT_WIDTH,
@@ -52,6 +64,7 @@ from config import (
 from controls import ControlStore
 from errors import WorkerError, fail
 from frames import FRAME_ACTIONS, NAVIGATION_INIT_SCRIPT, FrameStore, check_frame_access
+from live import LiveView
 from security import (
     NetworkPolicyError,
     PublicEgressProxy,
@@ -62,6 +75,33 @@ from security import (
 
 WaitUntil = Literal["load", "domcontentloaded", "networkidle", "commit"]
 logger = logging.getLogger("browser-worker.runtime")
+
+PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_UNSAFE_FILENAME = re.compile(r"[^A-Za-z0-9._ ()-]+")
+
+
+def _private_dir(path: Path, *, label: str) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+        raise WorkerError(f"{label} must be a service-owned directory")
+    os.chmod(path, 0o700)
+
+
+def safe_download_name(suggested: str) -> str:
+    name = _UNSAFE_FILENAME.sub("_", suggested.replace("\\", "/").rsplit("/", 1)[-1]).strip(" ._")
+    return name[-200:] or "download"
+
+
+def _tree_bytes(root: Path) -> int:
+    total = 0
+    for directory, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(directory, name)).st_size
+            except OSError:
+                continue
+    return total
 
 
 def chromium_hardening_args() -> list[str]:
@@ -94,6 +134,20 @@ class BrowserSession:
     controls: ControlStore = field(default_factory=ControlStore)
     approvals: ApprovalStore = field(default_factory=ApprovalStore)
     frames: FrameStore = field(default_factory=FrameStore)
+    profile: str | None = None
+    idle_ttl: int = IDLE_TTL_SECONDS
+    absolute_ttl: int = ABSOLUTE_TTL_SECONDS
+    downloads_dir: Path | None = None
+    downloads: list[dict[str, object]] = field(default_factory=list)
+    tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    live: LiveView = field(default_factory=LiveView)
+
+    @property
+    def persistent(self) -> bool:
+        return self.profile is not None
+
+    def expired(self, now: float) -> bool:
+        return now - self.touched_mono > self.idle_ttl or now - self.created_mono > self.absolute_ttl
 
 
 class BrowserManager:
@@ -103,10 +157,15 @@ class BrowserManager:
         *,
         resolver_factory: Any = PublicResolver,
         sessions_dir: Path = SESSIONS_DIR,
+        profiles_dir: Path | None = None,
     ) -> None:
         self.artifacts = artifact_store
         self.resolver_factory = resolver_factory
         self.sessions_dir = sessions_dir
+        # Durable profiles live beside the session root (PROFILES_DIR in production).
+        self.profiles_dir = profiles_dir or sessions_dir.parent / PROFILES_DIR.name
+        self._starting_profiles: set[tuple[str, str]] = set()
+        self._profile_cleanups: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._playwright: Playwright | None = None
         self._sessions: dict[str, BrowserSession] = {}
         self._closed_scopes: dict[tuple[str, str], float] = {}
@@ -125,15 +184,9 @@ class BrowserManager:
     async def start(self) -> None:
         if self._playwright is not None:
             return
-        self.sessions_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        info = self.sessions_dir.lstat()
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or stat.S_ISLNK(info.st_mode)
-            or info.st_uid != os.getuid()
-        ):
-            raise WorkerError("session root must be a service-owned directory")
-        os.chmod(self.sessions_dir, 0o700)
+        _private_dir(self.sessions_dir, label="session root")
+        # Durable profiles are never swept; only their owner-scoped root is validated.
+        _private_dir(self.profiles_dir, label="profile root")
         for child in self.sessions_dir.iterdir():
             if child.is_symlink() or child.is_file():
                 child.unlink(missing_ok=True)
@@ -168,12 +221,7 @@ class BrowserManager:
     async def sweep(self) -> None:
         now = time.monotonic()
         async with self._state_lock:
-            expired = [
-                session
-                for session in self._sessions.values()
-                if now - session.touched_mono > IDLE_TTL_SECONDS
-                or now - session.created_mono > ABSOLUTE_TTL_SECONDS
-            ]
+            expired = [session for session in self._sessions.values() if session.expired(now)]
             for session in expired:
                 self._sessions.pop(session.id, None)
             self._closed_scopes = {
@@ -198,14 +246,18 @@ class BrowserManager:
             async with self._admission_lock:
                 self._admitted -= 1
 
-    async def _new_context(self, profile_dir: Path, proxy: PublicEgressProxy) -> BrowserContext:
+    async def _new_context(
+        self, profile_dir: Path, proxy: PublicEgressProxy, downloads_dir: Path | None = None
+    ) -> BrowserContext:
         if self._playwright is None:
             raise WorkerError("browser runtime is not started")
         port = await proxy.start()
         args = chromium_hardening_args()
+        # Bound the on-disk cache that durable profiles would otherwise accumulate.
+        args.append("--disk-cache-size=104857600")
         options: dict[str, Any] = {
             "headless": HEADLESS,
-            "accept_downloads": False,
+            "accept_downloads": downloads_dir is not None,
             "service_workers": "block",
             "ignore_https_errors": False,
             "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
@@ -213,6 +265,8 @@ class BrowserManager:
             "proxy": {"server": f"http://127.0.0.1:{port}", "bypass": ""},
             "args": args,
         }
+        if downloads_dir is not None:
+            options["downloads_path"] = str(downloads_dir)
         if BROWSER_EXECUTABLE:
             options.pop("channel", None)
             options["executable_path"] = BROWSER_EXECUTABLE
@@ -260,7 +314,79 @@ class BrowserManager:
             del session.console[:-200]
 
         page.on("console", on_console)
-        page.on("download", lambda download: asyncio.create_task(download.cancel()))
+        page.on("download", lambda download: self._on_download(session, download))
+
+    def _spawn(self, session: BrowserSession, coro: Any, name: str) -> None:
+        task = asyncio.create_task(coro, name=name)
+        session.tasks.add(task)
+        task.add_done_callback(session.tasks.discard)
+
+    def _on_download(self, session: BrowserSession, download: Download) -> None:
+        if session.downloads_dir is None or session.disposed:
+            self._spawn(session, download.cancel(), f"browser-download-cancel-{session.id}")
+            return
+        self._spawn(session, self._capture_download(session, download), f"browser-download-{session.id}")
+
+    async def _capture_download(self, session: BrowserSession, download: Download) -> None:
+        """Retain one completed download as an owner-bound artifact, bounded in size and time."""
+        assert session.downloads_dir is not None
+        name = safe_download_name(download.suggested_filename)
+        try:
+            source_url = parse_public_url(download.url).geturl()
+        except NetworkPolicyError:
+            source_url = ""
+        entry: dict[str, object] = {
+            "download_id": secrets.token_urlsafe(12),
+            "filename": name,
+            "url": source_url[:8192],
+            "status": "in_progress",
+        }
+        session.downloads.append(entry)
+        del session.downloads[:-MAX_SESSION_DOWNLOADS]
+        completion = asyncio.create_task(download.path())
+        deadline = time.monotonic() + DOWNLOAD_DEADLINE_SECONDS
+        path: Path | None = None
+        try:
+            while not completion.done():
+                await asyncio.wait({completion}, timeout=0.5)
+                if completion.done():
+                    break
+                if _tree_bytes(session.downloads_dir) > MAX_DOWNLOAD_BYTES:
+                    entry.update(status="failed", error="download exceeds the size limit")
+                    await download.cancel()
+                    return
+                if time.monotonic() > deadline:
+                    entry.update(status="failed", error="download exceeded its deadline")
+                    await download.cancel()
+                    return
+            path = Path(completion.result())
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_DOWNLOAD_BYTES:
+                entry.update(status="failed", error="download exceeds the size limit")
+                return
+            data = await asyncio.to_thread(path.read_bytes)
+            mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            record = await self.artifacts.create(
+                session.owner,
+                data,
+                suffix="download",
+                mime_type=mime_type,
+                max_bytes=MAX_DOWNLOAD_BYTES,
+                name=name,
+            )
+            entry.update(status="completed", artifact=record.public())
+        except asyncio.CancelledError:
+            entry.update(status="failed", error="download was cancelled")
+            raise
+        except Exception as exc:  # noqa: BLE001 - downloads report a safe status, never raw errors
+            logger.debug("browser download ended: %s", type(exc).__name__)
+            entry.update(status="failed", error="download failed")
+        finally:
+            if not completion.done():
+                completion.cancel()
+            await asyncio.gather(completion, return_exceptions=True)
+            if path is not None:
+                path.unlink(missing_ok=True)
 
     async def open(
         self,
@@ -270,33 +396,71 @@ class BrowserManager:
         wait_until: WaitUntil,
         timeout_ms: int,
         scope_id: str | None = None,
+        profile: str | None = None,
+        downloads: bool = False,
     ) -> dict[str, object]:
+        """Open an ephemeral session, or reattach/launch the caller's durable named profile."""
+        if profile is not None and (scope_id is not None or not PROFILE_NAME.fullmatch(profile)):
+            raise fail("invalid_request")
         async with self.operation():
             await self.sweep()
             async with self._state_lock:
                 if scope_id and (owner, scope_id) in self._closed_scopes:
                     raise WorkerError("browser session scope is already closed")
+                existing = next(
+                    (
+                        live
+                        for live in self._sessions.values()
+                        if profile is not None and live.owner == owner and live.profile == profile
+                    ),
+                    None,
+                )
+                if existing is None and (owner, str(profile)) in self._starting_profiles:
+                    raise fail("session_busy")
+            if existing is not None:
+                return await self._reattach(existing, url, wait_until=wait_until, timeout_ms=timeout_ms)
+            closing = self._profile_cleanups.get((owner, str(profile)))
+            if closing is not None:
+                # Chromium holds a profile lock until the previous context is fully closed.
+                async with asyncio.timeout(15):
+                    await asyncio.shield(closing)
+            async with self._state_lock:
                 owner_count = sum(session.owner == owner for session in self._sessions.values())
                 owner_count += self._starting_by_owner.get(owner, 0)
                 if len(self._sessions) + self._starting_global >= MAX_GLOBAL_SESSIONS:
                     raise WorkerError("browser worker session capacity reached")
                 if owner_count >= MAX_CALLER_SESSIONS:
                     raise WorkerError("caller session capacity reached")
+                if profile is not None and (owner, profile) in self._starting_profiles:
+                    raise fail("session_busy")
                 self._starting_global += 1
                 self._starting_by_owner[owner] = self._starting_by_owner.get(owner, 0) + 1
+                if profile is not None:
+                    self._starting_profiles.add((owner, profile))
                 session_id = secrets.token_urlsafe(24)
-                profile_dir = self.sessions_dir / session_id
-                profile_dir.mkdir(mode=0o700)
+            downloads_dir = self.sessions_dir / f"{session_id}.downloads" if downloads else None
+            profile_dir = self.sessions_dir / session_id
             proxy = PublicEgressProxy(self.resolver_factory())
             context: BrowserContext | None = None
             session: BrowserSession | None = None
             inserted = False
             try:
-                context = await self._new_context(profile_dir, proxy)
+                if profile is None:
+                    profile_dir.mkdir(mode=0o700)
+                else:
+                    profile_dir = self._profile_dir(owner, profile)
+                if downloads_dir is not None:
+                    downloads_dir.mkdir(mode=0o700)
+                context = await self._new_context(profile_dir, proxy, downloads_dir)
                 now = time.monotonic()
                 session = BrowserSession(
                     session_id, owner, scope_id, now, now, profile_dir, proxy, context
                 )
+                session.downloads_dir = downloads_dir
+                if profile is not None:
+                    session.profile = profile
+                    session.idle_ttl = PERSISTENT_IDLE_TTL_SECONDS
+                    session.absolute_ttl = PERSISTENT_ABSOLUTE_TTL_SECONDS
                 for page in context.pages:
                     self._attach_page(session, page)
                 context.on("page", lambda page: self._attach_page(session, page))
@@ -331,16 +495,163 @@ class BrowserManager:
                         await asyncio.shield(proxy.close())
                     except BaseException as exc:  # noqa: BLE001 - profile cleanup must still run
                         logger.debug("partial proxy cleanup ended: %s", type(exc).__name__)
-                    shutil.rmtree(profile_dir, ignore_errors=True)
+                    if profile is None:
+                        shutil.rmtree(profile_dir, ignore_errors=True)
+                    if downloads_dir is not None:
+                        shutil.rmtree(downloads_dir, ignore_errors=True)
                 raise
             finally:
                 async with self._state_lock:
+                    if profile is not None:
+                        self._starting_profiles.discard((owner, profile))
                     self._starting_global -= 1
                     remaining = self._starting_by_owner.get(owner, 1) - 1
                     if remaining > 0:
                         self._starting_by_owner[owner] = remaining
                     else:
                         self._starting_by_owner.pop(owner, None)
+
+    def _profile_dir(self, owner: str, profile: str) -> Path:
+        # Caller IDs are validated identifiers, but hash them so the on-disk layout
+        # never depends on caller-controlled text beyond the validated profile name.
+        owner_dir = self.profiles_dir / hashlib.sha256(owner.encode("utf-8")).hexdigest()[:32]
+        _private_dir(owner_dir, label="profile owner directory")
+        profile_dir = owner_dir / profile
+        _private_dir(profile_dir, label="browser profile")
+        return profile_dir
+
+    async def _reattach(
+        self, session: BrowserSession, url: str | None, *, wait_until: WaitUntil, timeout_ms: int
+    ) -> dict[str, object]:
+        async with session.lock:
+            if session.disposed:
+                raise fail("invalid_session")
+            session.touched_mono = time.monotonic()
+            if url:
+                await self._navigate(session, url, wait_until=wait_until, timeout_ms=timeout_ms)
+            return {**await self._state(session), "reattached": True}
+
+    def list_sessions(self, owner: str) -> list[dict[str, object]]:
+        now = time.monotonic()
+        rows: list[dict[str, object]] = []
+        for session in self._sessions.values():
+            if session.owner != owner or session.disposed:
+                continue
+            pages = self._pages(session)
+            active = pages[min(session.active_index, len(pages) - 1)] if pages else None
+            rows.append(
+                {
+                    "session_id": session.id,
+                    "profile": session.profile,
+                    "persistent": session.persistent,
+                    "url": active.url if active is not None else "",
+                    "tab_count": len(pages),
+                    "idle_expires_in_seconds": max(0, int(session.idle_ttl - (now - session.touched_mono))),
+                }
+            )
+        return rows
+
+    async def live_events(self, owner: str, session_id: str) -> AsyncIterator[dict[str, object]]:
+        """Yield screencast frames and tab state for a viewer until the session ends."""
+        session = await self._get(owner, session_id)
+        live = session.live
+        if live.viewers >= MAX_LIVE_VIEWERS_PER_SESSION:
+            raise fail("session_busy")
+        live.viewers += 1
+        last_seq = -1
+        last_state: dict[str, object] | None = None
+        last_yield = time.monotonic()
+        try:
+            while not session.disposed and self._sessions.get(session.id) is session:
+                tick = live.tick
+                pages = self._pages(session)
+                if not pages:
+                    break
+                page = pages[min(session.active_index, len(pages) - 1)]
+                # Watching counts as activity so a supervised session does not idle out.
+                session.touched_mono = time.monotonic()
+                try:
+                    await live.follow(page)
+                except Exception as exc:  # noqa: BLE001 - a closing tab is followed by the next one
+                    logger.debug("live view follow ended: %s", type(exc).__name__)
+                state: dict[str, object] = {
+                    "url": page.url,
+                    "active_tab": session.active_index,
+                    "tab_count": len(pages),
+                }
+                if state != last_state:
+                    last_state = state
+                    last_yield = time.monotonic()
+                    yield {"event": "state", **state}
+                frame = live.frame
+                if frame is not None and frame["seq"] != last_seq:
+                    last_seq = int(frame["seq"])
+                    last_yield = time.monotonic()
+                    yield {"event": "frame", **frame}
+                    # Cap at ~10 frames/s; intermediate frames are superseded, not queued.
+                    await asyncio.sleep(0.1)
+                    continue
+                if time.monotonic() - last_yield >= 15:
+                    last_yield = time.monotonic()
+                    yield {"event": "ping"}
+                try:
+                    async with asyncio.timeout(0.5):
+                        await tick.wait()
+                except TimeoutError:
+                    pass
+            yield {"event": "closed"}
+        finally:
+            live.viewers -= 1
+            if live.viewers == 0:
+                await asyncio.shield(live.stop())
+
+    async def human_input(self, owner: str, session_id: str, event: dict[str, Any]) -> dict[str, object]:
+        """Apply one validated input event from a person supervising the live view."""
+        async with self.operation():
+            session = await self._get(owner, session_id)
+            try:
+                async with asyncio.timeout(10):
+                    await session.lock.acquire()
+            except TimeoutError as exc:
+                raise fail("session_busy") from exc
+            try:
+                if session.disposed:
+                    raise fail("invalid_session")
+                session.touched_mono = time.monotonic()
+                page = self._active_page(session)
+                kind = event["type"]
+                try:
+                    if kind == "click":
+                        await page.mouse.click(
+                            event["x"], event["y"], button=event["button"], click_count=event["click_count"]
+                        )
+                    elif kind == "wheel":
+                        await page.mouse.move(event["x"], event["y"])
+                        await page.mouse.wheel(event["dx"], event["dy"])
+                    elif kind == "key":
+                        await page.keyboard.press(event["key"])
+                    elif kind == "text":
+                        await page.keyboard.insert_text(event["text"])
+                    elif kind == "navigate":
+                        await self._navigate(
+                            session, event["url"], wait_until="domcontentloaded", timeout_ms=DEFAULT_TIMEOUT_MS
+                        )
+                    elif kind in {"back", "forward", "reload"}:
+                        move = {"back": page.go_back, "forward": page.go_forward, "reload": page.reload}[kind]
+                        await move(wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+                    else:
+                        raise fail("invalid_request")
+                except WorkerError:
+                    raise
+                except Exception as exc:
+                    raise WorkerError("browser input failed") from exc
+                # A person changed the page: discovered references are no longer trustworthy.
+                session.controls.invalidate()
+                session.approvals.invalidate()
+                session.live.wake()
+                return {"status": "ok", "session_id": session.id, "url": page.url}
+            finally:
+                session.lock.release()
 
     async def _get(self, owner: str, session_id: str) -> BrowserSession:
         await self.sweep()
@@ -413,8 +724,12 @@ class BrowserManager:
                 if session.disposed:
                     return
                 session.disposed = True
+                for task in list(session.tasks):
+                    task.cancel()
+                await asyncio.gather(*session.tasks, return_exceptions=True)
                 try:
                     async with asyncio.timeout(2):
+                        await session.live.stop()
                         await session.approvals.clear()
                         await session.frames.clear()
                 except Exception as exc:  # noqa: BLE001 - context cleanup must still run
@@ -430,9 +745,20 @@ class BrowserManager:
                 except Exception as exc:  # noqa: BLE001 - filesystem cleanup must still run
                     logger.warning("browser proxy cleanup failed: %s", type(exc).__name__)
                 finally:
-                    shutil.rmtree(session.profile_dir, ignore_errors=True)
+                    if not session.persistent:
+                        shutil.rmtree(session.profile_dir, ignore_errors=True)
+                    if session.downloads_dir is not None:
+                        shutil.rmtree(session.downloads_dir, ignore_errors=True)
 
         task = asyncio.create_task(cleanup(), name=f"browser-dispose-{session.id}")
+        if session.profile is not None:
+            key = (session.owner, session.profile)
+            self._profile_cleanups[key] = task
+            task.add_done_callback(
+                lambda done: self._profile_cleanups.pop(key, None)
+                if self._profile_cleanups.get(key) is done
+                else None
+            )
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -485,7 +811,7 @@ class BrowserManager:
     async def _state(self, session: BrowserSession) -> dict[str, object]:
         pages = self._pages(session)
         now = time.monotonic()
-        return {
+        state: dict[str, object] = {
             "status": "ok",
             "session_id": session.id,
             "active_tab": session.active_index,
@@ -493,9 +819,12 @@ class BrowserManager:
                 {"index": index, "url": page.url, "title": (await page.title())[:500]}
                 for index, page in enumerate(pages)
             ],
-            "idle_expires_in_seconds": max(0, int(IDLE_TTL_SECONDS - (now - session.touched_mono))),
-            "absolute_expires_in_seconds": max(0, int(ABSOLUTE_TTL_SECONDS - (now - session.created_mono))),
+            "idle_expires_in_seconds": max(0, int(session.idle_ttl - (now - session.touched_mono))),
+            "absolute_expires_in_seconds": max(0, int(session.absolute_ttl - (now - session.created_mono))),
         }
+        if session.persistent:
+            state["profile"] = session.profile
+        return state
 
     async def _ensure_capture_bounds(self, page: Page) -> None:
         try:
@@ -564,13 +893,13 @@ class BrowserManager:
                     return {"status": "ok", "session_id": session.id, **result}
                 if action in {"prepare_action", "execute_prepared", "discard_prepared"} and (
                     self._sessions.get(session_id) is not session or session.disposed
-                    or time.monotonic() >= session.created_mono + ABSOLUTE_TTL_SECONDS
+                    or time.monotonic() >= session.created_mono + session.absolute_ttl
                 ):
                     raise fail("invalid_session")
                 if action == "prepare_action":
                     result = await session.approvals.prepare(
                         page, params["operation"], params, frame=frame,
-                        session_deadline=session.created_mono + ABSOLUTE_TTL_SECONDS,
+                        session_deadline=session.created_mono + session.absolute_ttl,
                     )
                     if params.get("frame_id") is not None:
                         try:
@@ -793,6 +1122,8 @@ class BrowserManager:
                         raise WorkerError("PDF export failed") from exc
                     record = await self.artifacts.create(owner, data, suffix="pdf", mime_type="application/pdf", max_bytes=MAX_PDF_BYTES)
                     return {"status": "ok", "session_id": session.id, "artifact": record.public()}
+                if action == "downloads":
+                    return {"status": "ok", "session_id": session.id, "downloads": [dict(row) for row in session.downloads]}
                 if action == "console":
                     limit = min(50, int(params.get("limit") or 50))
                     return {"status": "ok", "session_id": session.id, "events": session.console[-limit:]}

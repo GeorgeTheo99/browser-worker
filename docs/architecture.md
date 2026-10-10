@@ -7,7 +7,7 @@ Status: worker implementation contract. The installer bootstraps a local Pi prod
 `browser-worker` is a standalone loopback MCP service. It does not import, call, proxy, monitor, or fall back to `local_web_search`. Search/fetch health is not a browser-worker dependency. The worker exposes exactly two model-facing tools:
 
 - `browser_fetch` — one-shot rendered retrieval with no retained browser session.
-- `browser_inspect` — short-lived, caller-owned browser sessions and actions.
+- `browser_inspect` — caller-owned browser sessions and actions, ephemeral by default or durable with a granted named profile.
 
 Pi's `app_*` local/private testing tools remain in-process and out of scope.
 
@@ -52,7 +52,7 @@ Actions:
 - Navigation/tabs: `navigate`, `open_tab`, `list_tabs`, `switch_tab`, `close_tab`
 - Read-only inspection: `extract_text`, `extract_links`, `controls`, `elements`, `frames`, `wait`, `console`
 - Restricted research interaction: `expand_control`, `select_option` (explicit `inspect.controls` grant)
-- Artifacts: `screenshot`, `export_pdf`
+- Artifacts: `screenshot`, `export_pdf`, `downloads` (explicit `inspect.download` grant)
 - Server-mediated confirmation capability: `prepare_action`, `execute_prepared`, `discard_prepared`
 - Interactive Pi capability: `click`, `type`
 - Privileged Pi-only capability: `evaluate`
@@ -60,6 +60,15 @@ Actions:
 Common fields are optional at the JSON-Schema layer for model compatibility and strictly checked per action: `session_id`, `scope_id`, `url`, `selector`, `frame_id`, `control_id`, `option`, `text`, `tab_index`, `timeout_ms`, `wait_until`, `state`, `url_contains`, `max_chars`, `limit`, `clear`, `submit`, `full_page`, `format`, `landscape`, `print_background`, `script`, `arg`, `operation`, and `proposal_id`.
 
 `open` creates an isolated ephemeral profile and may navigate to `url`. Every later action requires the opaque `session_id`. Sessions are bound to the authenticated caller, expire after 5 minutes idle or 15 minutes total, and cannot survive a worker restart.
+
+### Durable profiles, downloads, and live view
+
+- **Durable profile** (`inspect.persistent`): `open` with `profile` (`^[a-z0-9][a-z0-9_-]{0,63}$`, e.g. `default`) launches Chromium on an owner-only profile directory under `profiles/<sha256(caller)[:32]>/<profile>`. Cookies, storage, and sign-ins persist across sessions and worker restarts. While a session for that caller/profile is live, `open` reattaches to it (`reattached: true`, optional `url` navigates) instead of launching a second browser. Durable sessions are not scope-bound (`scope_id` is rejected), expire after 30 minutes idle or 8 hours total (`BROWSER_WORKER_PERSISTENT_*_TTL_SECONDS`), and their profile is retained on close/expiry; a relaunch waits for the previous context to release the profile. Watching the live view counts as activity. Ephemeral sessions are unchanged. Public-network egress applies identically; a profile is not a credential vault and the worker never exposes cookies or profile files.
+- **Downloads** (`inspect.download`): sessions opened by such a caller accept downloads into a per-session owner-only directory. Each completed download (≤ 50 MiB, ≤ 300 s, cancelled when the in-flight directory exceeds the cap) becomes an owner-bound artifact with a sanitized `filename` and extension-derived MIME type, served as an attachment with `nosniff` and a sandbox CSP. `downloads` returns at most the 20 latest `{download_id, filename, url, status: in_progress|completed|failed, artifact?, error?}` rows. Download bytes count toward the caller artifact quota and 30-minute artifact TTL; clients must retain them promptly. Without the grant, downloads are cancelled as before.
+- **Live view** (`inspect.live`), plain authenticated HTTP routes beside `/mcp`, owner-bound like artifacts:
+  - `GET /sessions` → `{status, sessions:[{session_id, profile, persistent, url, tab_count, idle_expires_in_seconds}]}`.
+  - `GET /sessions/{id}/live` → `text/event-stream` of `state` (`{url, active_tab, tab_count}`), `frame` (`{seq, data: base64 JPEG, width, height}` in CSS viewport pixels, at most ~10/s, latest-wins), and a final `closed`; `: keepalive` comments every 15 s. A Chromium CDP screencast follows the active tab and runs only while at least one of at most 4 viewers is attached.
+  - `POST /sessions/{id}/input` (≤ 16 KiB JSON) applies one human event: `click {x,y,button?,click_count?}`, `wheel {x,y,dx?,dy?}`, `key {key}` (Playwright key names with optional modifiers), `text {text ≤ 2000}`, `navigate {url}` (public URL policy), `back`, `forward`, `reload`. Events are trusted browser input from the supervising person, serialize with agent actions on the session lock (409 `session_busy` after 10 s), and invalidate discovered controls/approvals. Access/CAPTCHA detection does not block human input: this is how a person completes a sign-in or challenge the agent must not bypass.
 
 ### Frame contract
 
@@ -119,6 +128,9 @@ Capability tiers:
 | `inspect.artifact` | screenshot/PDF creation and owner-bound retrieval |
 | `inspect.interact` | direct click/type; type's extra Enter press requires `submit=true`, but clicks can activate forms |
 | `inspect.script` | page evaluation |
+| `inspect.persistent` | `open` with a durable named `profile` |
+| `inspect.download` | accept page downloads as artifacts; `downloads` listing |
+| `inspect.live` | `/sessions` listing, live screencast stream, and human input routes |
 
 Client policy:
 
@@ -148,7 +160,7 @@ Input hostname checks are not the security boundary. Each browser session uses a
 - QUIC disabled,
 - service workers blocked,
 - non-proxied WebRTC disabled,
-- downloads disabled.
+- downloads disabled unless the caller holds `inspect.download` (bounded, retained only as owner-bound artifacts).
 
 For every HTTP request, HTTPS `CONNECT`, WebSocket upgrade, redirect target, and subresource connection, the proxy:
 
@@ -167,8 +179,8 @@ Defaults, all bounded by hard caps:
 - 4 live sessions globally
 - 2 live sessions per caller
 - 8 admitted operations globally
-- 5-minute idle TTL
-- 15-minute absolute TTL
+- 5-minute idle TTL (30 minutes for durable profiles)
+- 15-minute absolute TTL (8 hours for durable profiles)
 - 60-second operation deadline
 - 64 KiB proxy request-header cap
 - 50,000 returned text characters
@@ -176,7 +188,7 @@ Defaults, all bounded by hard caps:
 - 20 MiB screenshot and 50 MiB PDF artifact caps
 - 30-minute artifact TTL and 100 MiB artifact quota per caller
 
-A startup sweep removes orphaned session/profile directories. Close, expiration, cancellation, browser crashes, and shutdown all close Chromium/proxy resources and remove profiles. Admission fails quickly instead of allowing an unbounded queue.
+A startup sweep removes orphaned ephemeral session/download directories. Close, expiration, cancellation, browser crashes, and shutdown all close Chromium/proxy resources and remove ephemeral profiles; durable profiles are retained. Admission fails quickly instead of allowing an unbounded queue.
 
 ## Artifact boundary
 
@@ -190,7 +202,8 @@ Callers cannot provide output paths. Screenshots and PDFs are written atomically
 4. Egress: literal private IPv4/IPv6, localhost aliases, mixed DNS, DNS re-resolution, HTTP redirects, HTTPS CONNECT, subresources, WebSockets, Chromium proxy bypass, and QUIC/WebRTC policy.
 5. Lifecycle: idle/absolute TTL, per-caller/global limits, admission, cancellation, crash cleanup, startup orphan cleanup.
 6. Artifacts: traversal, symlink, hardlink/replacement, quota, expiry, MIME, hash, and atomic write checks.
-7. Browser behavior: rendered text, navigation, tabs, waits, screenshots/PDFs, console, interaction, downloads blocked, and no persistent cookies across sessions.
+7. Browser behavior: rendered text, navigation, tabs, waits, screenshots/PDFs, console, interaction, downloads blocked without the grant, and no persistent cookies across ephemeral sessions.
+10. Durable/live: profile reattach/retention/isolation, long TTLs, scope rejection, download capture and naming, screencast frames, validated human input, live-route auth and owner binding.
 8. Operator: plist validation, private modes, exact listener/tool inventory, restart and health.
 9. Confirmation: no-effect discovery/preparation, exact frozen text/script/JSON, explicit label submission, discard/expiry/replay, owner/session isolation, target/form/URL/document/tab changes, navigation race guards, cancellation cleanup, unchanged raw/artifact capabilities and public egress.
 

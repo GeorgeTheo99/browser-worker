@@ -66,7 +66,7 @@ async def fake_manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple
     manager = BrowserManager(artifacts, sessions_dir=sessions)
     manager._playwright = object()  # type: ignore[assignment]
 
-    async def new_context(_profile: Path, proxy: Any) -> FakeContext:
+    async def new_context(_profile: Path, proxy: Any, _downloads: Path | None = None) -> FakeContext:
         await proxy.start()
         return FakeContext()
 
@@ -177,7 +177,7 @@ async def test_scope_cleanup_closes_known_and_inflight_opens(
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def delayed_context(_profile: Path, proxy: Any) -> FakeContext:
+    async def delayed_context(_profile: Path, proxy: Any, _downloads: Path | None = None) -> FakeContext:
         await proxy.start()
         started.set()
         await release.wait()

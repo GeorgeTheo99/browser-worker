@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -11,11 +13,11 @@ from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
 from pydantic import Field
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from approvals import MAX_ARG_BYTES
 from artifacts import ArtifactError, ArtifactStore
-from auth import ClientRegistry, current_caller
+from auth import Caller, ClientRegistry, current_caller
 from browser_runtime import BrowserManager, WorkerError
 from config import (
     ARTIFACTS_DIR,
@@ -26,10 +28,12 @@ from config import (
     MAX_OPERATION_TIMEOUT_MS,
     MAX_TEXT_CHARS,
     ROOT_DIR,
+    VIEWPORT_HEIGHT,
+    VIEWPORT_WIDTH,
 )
 from errors import ERROR_MESSAGES
 from frames import FRAME_ACTIONS
-from security import NetworkPolicyError
+from security import NetworkPolicyError, parse_public_url
 
 logger = logging.getLogger("browser-worker.mcp")
 
@@ -55,6 +59,7 @@ InspectAction = Literal[
     "select_option",
     "wait",
     "console",
+    "downloads",
     "screenshot",
     "export_pdf",
     "click",
@@ -99,8 +104,10 @@ mcp = FastMCP(
     "browser-worker",
     version="0.1.0",
     instructions=(
-        "Rendered public-web retrieval and short-lived browser inspection. "
-        "Use browser_fetch for a one-shot rendered page and browser_inspect for stateful actions."
+        "Rendered public-web retrieval and caller-owned browser sessions. "
+        "Use browser_fetch for a one-shot rendered page and browser_inspect for stateful actions. "
+        "Callers granted durable profiles can open profile='default' to reuse one long-lived browser "
+        "whose sign-ins persist; a person can watch and take over that browser through the live view."
     ),
     lifespan=lifespan,
     strict_input_validation=True,
@@ -219,12 +226,24 @@ async def browser_inspect(
     arg: Any | None = None,
     operation: Literal["click", "type", "evaluate"] | None = None,
     proposal_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
+    profile: Annotated[
+        str | None, Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    ] = None,
 ) -> ToolResult:
-    """Create or operate a short-lived caller-owned browser session using one explicit action."""
+    """Create or operate a caller-owned browser session using one explicit action.
+
+    `open` with `profile` reattaches to (or launches) a durable named browser profile whose
+    cookies and sign-ins persist across sessions; without it, the session is ephemeral.
+    `downloads` lists files the page downloaded, each retrievable as an artifact.
+    """
     caller = current_caller()
     try:
         caller.require("inspect.read")
         timeout = _bounded_timeout(timeout_ms)
+        if profile is not None:
+            if action != "open":
+                raise WorkerError("profile is only accepted for open")
+            caller.require("inspect.persistent")
         if frame_id is not None and action not in FRAME_ACTIONS:
             raise WorkerError("frame_id is unsupported for this action")
         if frame_id is not None:
@@ -274,6 +293,8 @@ async def browser_inspect(
             if url is not None:
                 _bounded_text(url, name="url", maximum=8192, required=True)
             scope = _bounded_text(scope_id, name="scope_id", maximum=128)
+            if profile is not None and scope is not None:
+                raise WorkerError("durable profiles are not scope-bound")
             return await _safe_call(
                 manager.open(
                     caller.id,
@@ -281,6 +302,8 @@ async def browser_inspect(
                     wait_until=wait_until,
                     timeout_ms=timeout,
                     scope_id=scope,
+                    profile=profile,
+                    downloads="inspect.download" in caller.capabilities,
                 )
             )
         if action == "cleanup_scope":
@@ -352,6 +375,8 @@ async def browser_inspect(
             params["url_contains"] = _bounded_text(url_contains, name="url_contains", maximum=2000)
         elif action in {"screenshot", "export_pdf"}:
             caller.require("inspect.artifact")
+        elif action == "downloads":
+            caller.require("inspect.download")
         elif action == "evaluate":
             caller.require("inspect.script")
             params["script"] = _bounded_text(script, name="script", maximum=20_000, required=True)
@@ -420,17 +445,175 @@ async def artifact(request: Request) -> Response:
         record, data = await artifacts.read(caller.id, request.path_params["artifact_id"])
     except (PermissionError, ArtifactError):
         return JSONResponse({"error": "artifact not found"}, status_code=404, headers={"Cache-Control": "no-store"})
-    suffix = "png" if record.mime_type == "image/png" else "pdf"
+    if record.name is not None:
+        filename = record.name
+    else:
+        filename = f"browser-artifact-{record.id}.{'png' if record.mime_type == 'image/png' else 'pdf'}"
     return Response(
         data,
         media_type=record.mime_type,
         headers={
             "Cache-Control": "private, no-store",
             "X-Content-Type-Options": "nosniff",
-            "Content-Disposition": f'attachment; filename="browser-artifact-{record.id}.{suffix}"',
+            "Content-Disposition": f'attachment; filename="{filename}"',
             "Content-Security-Policy": "default-src 'none'; sandbox",
         },
     )
+
+
+_LIVE_KEY = re.compile(r"(?:(?:Control|Shift|Alt|Meta)\+){0,3}(?:[A-Za-z0-9]{1,16}|[-=\[\];',./`\\])")
+_NO_STORE = {"Cache-Control": "no-store"}
+
+
+def _route_caller(request: Request, capability: str) -> Caller | JSONResponse:
+    values = request.headers.getlist("authorization")
+    caller = registry.authenticate_header(values[0] if len(values) == 1 else None)
+    if caller is None:
+        return JSONResponse(
+            {"error": "authentication required"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer", **_NO_STORE},
+        )
+    try:
+        caller.require(capability)
+    except PermissionError:
+        return JSONResponse({"error": ERROR_MESSAGES["capability_denied"]}, status_code=403, headers=_NO_STORE)
+    return caller
+
+
+def _route_error(exc: WorkerError) -> JSONResponse:
+    status = {"invalid_session": 404, "session_busy": 409, "blocked_access": 403, "invalid_request": 400}.get(
+        exc.code, 502
+    )
+    return JSONResponse(
+        {"status": "error", "code": exc.code, "error": ERROR_MESSAGES[exc.code]}, status_code=status, headers=_NO_STORE
+    )
+
+
+def _coordinate(value: Any, maximum: int) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise WorkerError("coordinate is invalid", code="invalid_request")
+    if not 0 <= value <= maximum:
+        raise WorkerError("coordinate is outside the viewport", code="invalid_request")
+    return float(value)
+
+
+def _delta(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or abs(value) > 10_000:
+        raise WorkerError("scroll delta is invalid", code="invalid_request")
+    return float(value)
+
+
+def parse_live_input(body: Any) -> dict[str, Any]:
+    """Validate one human input event; coordinates are CSS pixels in the viewport."""
+    if not isinstance(body, dict) or not isinstance(body.get("type"), str):
+        raise WorkerError("input event is invalid", code="invalid_request")
+    kind = body["type"]
+    fields: dict[str, set[str]] = {
+        "click": {"type", "x", "y", "button", "click_count"},
+        "wheel": {"type", "x", "y", "dx", "dy"},
+        "key": {"type", "key"},
+        "text": {"type", "text"},
+        "navigate": {"type", "url"},
+        "back": {"type"},
+        "forward": {"type"},
+        "reload": {"type"},
+    }
+    if kind not in fields or not set(body) <= fields[kind]:
+        raise WorkerError("input event is invalid", code="invalid_request")
+    event: dict[str, Any] = {"type": kind}
+    if kind in {"click", "wheel"}:
+        event["x"] = _coordinate(body.get("x"), VIEWPORT_WIDTH)
+        event["y"] = _coordinate(body.get("y"), VIEWPORT_HEIGHT)
+    if kind == "click":
+        button = body.get("button", "left")
+        clicks = body.get("click_count", 1)
+        if button not in {"left", "middle", "right"} or clicks not in {1, 2, 3} or isinstance(clicks, bool):
+            raise WorkerError("click is invalid", code="invalid_request")
+        event.update(button=button, click_count=clicks)
+    elif kind == "wheel":
+        event.update(dx=_delta(body.get("dx", 0)), dy=_delta(body.get("dy", 0)))
+    elif kind == "key":
+        key = body.get("key")
+        if not isinstance(key, str) or not _LIVE_KEY.fullmatch(key):
+            raise WorkerError("key is invalid", code="invalid_request")
+        event["key"] = key
+    elif kind == "text":
+        text = body.get("text")
+        if not isinstance(text, str) or not 1 <= len(text) <= 2000:
+            raise WorkerError("text is invalid", code="invalid_request")
+        event["text"] = text
+    elif kind == "navigate":
+        url = body.get("url")
+        try:
+            parse_public_url(url)
+        except NetworkPolicyError as exc:
+            raise WorkerError("URL is not public", code="invalid_request") from exc
+        event["url"] = url
+    return event
+
+
+@mcp.custom_route("/sessions", methods=["GET"])
+async def list_sessions(request: Request) -> JSONResponse:
+    caller = _route_caller(request, "inspect.live")
+    if isinstance(caller, JSONResponse):
+        return caller
+    return JSONResponse({"status": "ok", "sessions": manager.list_sessions(caller.id)}, headers=_NO_STORE)
+
+
+@mcp.custom_route("/sessions/{session_id}/live", methods=["GET"])
+async def live_view(request: Request) -> Response:
+    caller = _route_caller(request, "inspect.live")
+    if isinstance(caller, JSONResponse):
+        return caller
+    events = manager.live_events(caller.id, str(request.path_params["session_id"])[:128])
+    try:
+        first = await anext(events)
+    except WorkerError as exc:
+        return _route_error(exc)
+
+    async def stream() -> Any:
+        try:
+            event: dict[str, Any] | None = first
+            while event is not None:
+                name = str(event.pop("event"))
+                if name == "ping":
+                    yield ": keepalive\n\n"
+                else:
+                    yield f"event: {name}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
+                if await request.is_disconnected():
+                    break
+                event = await anext(events, None)
+        finally:
+            await events.aclose()
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@mcp.custom_route("/sessions/{session_id}/input", methods=["POST"])
+async def live_input(request: Request) -> JSONResponse:
+    caller = _route_caller(request, "inspect.live")
+    if isinstance(caller, JSONResponse):
+        return caller
+    raw = await request.body()
+    try:
+        if len(raw) > 16_384:
+            raise WorkerError("input event is too large", code="invalid_request")
+        try:
+            body = json.loads(raw)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise WorkerError("input event is not JSON", code="invalid_request") from exc
+        event = parse_live_input(body)
+        result = await manager.human_input(caller.id, str(request.path_params["session_id"])[:128], event)
+    except WorkerError as exc:
+        return _route_error(exc)
+    except NetworkPolicyError:
+        return _route_error(WorkerError("blocked", code="blocked_access"))
+    return JSONResponse(result, headers=_NO_STORE)
 
 
 if __name__ == "__main__":
