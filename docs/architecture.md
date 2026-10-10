@@ -176,8 +176,8 @@ This closes DNS-rebinding and redirect/subresource gaps: validation and connecti
 
 Defaults, all bounded by hard caps:
 
-- 4 live sessions globally
-- 2 live sessions per caller
+- 8 live sessions globally
+- 4 live sessions per caller (clients may keep one per conversation between turns)
 - 8 admitted operations globally
 - 5-minute idle TTL (30 minutes for durable profiles)
 - 15-minute absolute TTL (8 hours for durable profiles)
