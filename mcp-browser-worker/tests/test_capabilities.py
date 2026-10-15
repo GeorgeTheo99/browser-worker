@@ -38,6 +38,17 @@ async def test_read_only_caller_cannot_interact_script_or_create_artifacts() -> 
 
 
 @pytest.mark.asyncio
+async def test_fetch_in_a_session_requires_inspect_read() -> None:
+    token = auth._current_caller.set(Caller("fetch-only", frozenset({"fetch"})))
+    try:
+        result = await browser_fetch("https://example.com", session_id="opaque-session")
+        assert result.is_error
+        assert result.structured_content["code"] == "capability_denied"
+    finally:
+        auth._current_caller.reset(token)
+
+
+@pytest.mark.asyncio
 async def test_confirmation_is_not_raw_interaction_or_artifact_authority(monkeypatch):
     import server
 

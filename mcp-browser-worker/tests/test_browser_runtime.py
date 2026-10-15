@@ -159,3 +159,72 @@ async def test_ephemeral_rendered_session_and_private_subresource_block(
         await artifacts.close()
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_fetch_in_open_session_keeps_it_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fixture(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        first = (await reader.read(65536)).split(b"\r\n", 1)[0].decode("latin-1")
+        name = b"B" if " /b " in first else b"A"
+        body = b"<!doctype html><title>" + name + b"</title><body><p>Page " + name + b"</p></body>"
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: "
+            + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(fixture, "127.0.0.1", 0)
+    port = int((server.sockets or [])[0].getsockname()[1])
+    monkeypatch.setattr(security, "ALLOWED_DESTINATION_PORTS", frozenset({80, 443, port}))
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    await artifacts.start()
+    manager = BrowserManager(
+        artifacts, resolver_factory=lambda: BrowserFixtureResolver(port), sessions_dir=tmp_path / "sessions"
+    )
+    await manager.start()
+    options = {"max_chars": 5000, "wait_until": "domcontentloaded", "timeout_ms": 15_000,
+               "include_links": False, "include_screenshot": False}
+    try:
+        opened = await manager.open("owner", None, wait_until="domcontentloaded", timeout_ms=15_000)
+        session_id = str(opened["session_id"])
+        for name in ("a", "b"):
+            fetched = await manager.fetch("owner", f"http://public.test:{port}/{name}", session_id=session_id, **options)
+            assert fetched["session_id"] == session_id
+            assert fetched["final_url"] == f"http://public.test:{port}/{name}"
+            assert f"Page {name.upper()}" in str(fetched["text"])
+        state = await manager.act("owner", session_id, "state")
+        assert [tab["url"] for tab in state["tabs"]] == [f"http://public.test:{port}/b"]
+        assert manager.live_sessions == 1
+
+        with pytest.raises(WorkerError) as foreign:
+            await manager.fetch("other-owner", f"http://public.test:{port}/a", session_id=session_id, **options)
+        assert foreign.value.code == "invalid_session"
+        with pytest.raises(security.NetworkPolicyError):
+            await manager.fetch("owner", f"http://127.0.0.1:{port}/a", session_id=session_id, **options)
+        assert manager.live_sessions == 1
+
+        session = manager._sessions[session_id]
+        await session.lock.acquire()
+        try:
+            with pytest.raises(WorkerError) as busy:
+                await manager.fetch("owner", f"http://public.test:{port}/a", session_id=session_id, **options)
+            assert busy.value.code == "session_busy"
+        finally:
+            session.lock.release()
+
+        one_shot = await manager.fetch("owner", f"http://public.test:{port}/a", **options)
+        assert "session_id" not in one_shot and manager.live_sessions == 1
+
+        await manager.close("owner", session_id)
+        with pytest.raises(WorkerError) as closed:
+            await manager.fetch("owner", f"http://public.test:{port}/a", session_id=session_id, **options)
+        assert closed.value.code == "invalid_session"
+        assert manager.live_sessions == 0
+    finally:
+        await manager.shutdown()
+        await artifacts.close()
+        server.close()
+        await server.wait_closed()

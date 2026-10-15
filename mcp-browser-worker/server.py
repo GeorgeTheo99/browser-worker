@@ -176,11 +176,19 @@ async def browser_fetch(
     timeout_ms: Annotated[int, Field(ge=1_000, le=MAX_OPERATION_TIMEOUT_MS)] = DEFAULT_TIMEOUT_MS,
     include_links: bool = False,
     include_screenshot: bool = False,
+    session_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
 ) -> ToolResult:
-    """Render one public page, return visible text, and destroy the browser profile before returning."""
+    """Render one public page and return visible text.
+
+    Without `session_id` the browser profile is destroyed before returning. With the
+    `session_id` of an open caller-owned session, its active tab navigates to `url` and the
+    session stays open.
+    """
     caller = current_caller()
     try:
         caller.require("fetch")
+        if session_id is not None:
+            caller.require("inspect.read")
         if include_screenshot:
             caller.require("inspect.artifact")
     except PermissionError:
@@ -194,6 +202,7 @@ async def browser_fetch(
             timeout_ms=_bounded_timeout(timeout_ms),
             include_links=bool(include_links),
             include_screenshot=bool(include_screenshot),
+            session_id=session_id,
         )
     )
 

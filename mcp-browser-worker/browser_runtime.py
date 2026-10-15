@@ -1153,64 +1153,99 @@ class BrowserManager:
         timeout_ms: int,
         include_links: bool,
         include_screenshot: bool,
+        session_id: str | None = None,
     ) -> dict[str, object]:
+        """Render one page in a throwaway session, or in the caller's open `session_id`, kept open."""
         started = time.monotonic()
+        render = {"max_chars": max_chars, "timeout_ms": timeout_ms, "include_links": include_links,
+                  "include_screenshot": include_screenshot}
+        if session_id is not None:
+            async with self.operation():
+                session = await self._get(owner, session_id)
+                # Like live input, a fetch does not queue behind someone using the browser.
+                try:
+                    async with asyncio.timeout(10):
+                        await session.lock.acquire()
+                except TimeoutError as exc:
+                    raise fail("session_busy") from exc
+                try:
+                    if session.disposed:
+                        raise fail("invalid_session")
+                    await self._navigate(session, url, wait_until=wait_until, timeout_ms=timeout_ms)
+                    return {**await self._render(owner, session, url, started, **render), "session_id": session.id}
+                finally:
+                    session.lock.release()
         state = await self.open(owner, url, wait_until=wait_until, timeout_ms=timeout_ms)
         session_id = str(state["session_id"])
         try:
             session = await self._get(owner, session_id)
             async with session.lock:
-                page = self._active_page(session)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=min(3000, timeout_ms))
-                except Exception as exc:  # noqa: BLE001 - network idle is explicitly best-effort
-                    logger.debug("best-effort network-idle wait ended: %s", type(exc).__name__)
-                try:
-                    text = await page.locator("body").evaluate(
-                        "(el, limit) => (el.innerText || el.textContent || '').slice(0, limit + 1)",
-                        max_chars,
-                    )
-                except Exception as exc:
-                    raise WorkerError("rendered text extraction failed") from exc
-                result: dict[str, object] = {
-                    "status": "ok",
-                    "requested_url": url,
-                    "final_url": page.url,
-                    "title": (await page.title())[:500],
-                    "text": text[:max_chars],
-                    "truncated": len(text) > max_chars,
-                    "elapsed_ms": int((time.monotonic() - started) * 1000),
-                }
-                if include_links:
-                    raw_links = await page.locator("a[href]").evaluate_all(
-                        "(els, limit) => els.slice(0, limit).map(el => ({text:(el.innerText||el.textContent||'').trim(), url:el.href||''}))",
-                        400,
-                    )
-                    links: list[dict[str, str]] = []
-                    for row in raw_links if isinstance(raw_links, list) else []:
-                        if not isinstance(row, dict):
-                            continue
-                        try:
-                            parse_public_url(str(row.get("url") or ""))
-                        except NetworkPolicyError:
-                            continue
-                        links.append(
-                            {
-                                "text": str(row.get("text") or "")[:500],
-                                "url": str(row.get("url") or "")[:8192],
-                            }
-                        )
-                        if len(links) >= MAX_LINKS:
-                            break
-                    result["links"] = links
-                if include_screenshot:
-                    await self._ensure_capture_bounds(page)
-                    data = await page.screenshot(full_page=True, type="png")
-                    record = await self.artifacts.create(owner, data, suffix="png", mime_type="image/png", max_bytes=MAX_SCREENSHOT_BYTES)
-                    result["artifact"] = record.public()
-                return result
+                return await self._render(owner, session, url, started, **render)
         finally:
             try:
                 await asyncio.shield(self.close(owner, session_id))
             except BaseException as exc:  # noqa: BLE001 - one-shot cleanup must not replace the result
                 logger.warning("one-shot browser cleanup ended: %s", type(exc).__name__)
+
+    async def _render(
+        self,
+        owner: str,
+        session: BrowserSession,
+        url: str,
+        started: float,
+        *,
+        max_chars: int,
+        timeout_ms: int,
+        include_links: bool,
+        include_screenshot: bool,
+    ) -> dict[str, object]:
+        """Read the active tab's visible text; the caller holds the session lock."""
+        page = self._active_page(session)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=min(3000, timeout_ms))
+        except Exception as exc:  # noqa: BLE001 - network idle is explicitly best-effort
+            logger.debug("best-effort network-idle wait ended: %s", type(exc).__name__)
+        try:
+            text = await page.locator("body").evaluate(
+                "(el, limit) => (el.innerText || el.textContent || '').slice(0, limit + 1)",
+                max_chars,
+            )
+        except Exception as exc:
+            raise WorkerError("rendered text extraction failed") from exc
+        result: dict[str, object] = {
+            "status": "ok",
+            "requested_url": url,
+            "final_url": page.url,
+            "title": (await page.title())[:500],
+            "text": text[:max_chars],
+            "truncated": len(text) > max_chars,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+        if include_links:
+            raw_links = await page.locator("a[href]").evaluate_all(
+                "(els, limit) => els.slice(0, limit).map(el => ({text:(el.innerText||el.textContent||'').trim(), url:el.href||''}))",
+                400,
+            )
+            links: list[dict[str, str]] = []
+            for row in raw_links if isinstance(raw_links, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    parse_public_url(str(row.get("url") or ""))
+                except NetworkPolicyError:
+                    continue
+                links.append(
+                    {
+                        "text": str(row.get("text") or "")[:500],
+                        "url": str(row.get("url") or "")[:8192],
+                    }
+                )
+                if len(links) >= MAX_LINKS:
+                    break
+            result["links"] = links
+        if include_screenshot:
+            await self._ensure_capture_bounds(page)
+            data = await page.screenshot(full_page=True, type="png")
+            record = await self.artifacts.create(owner, data, suffix="png", mime_type="image/png", max_bytes=MAX_SCREENSHOT_BYTES)
+            result["artifact"] = record.public()
+        return result
