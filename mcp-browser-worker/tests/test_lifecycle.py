@@ -103,6 +103,18 @@ async def test_idle_sweep_removes_session_profile(tmp_path: Path, monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_expired_session_is_not_listed_before_sweep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager, artifacts = await fake_manager(tmp_path, monkeypatch)
+    state = await manager.open("owner", None, wait_until="domcontentloaded", timeout_ms=1000)
+    session_id = str(state["session_id"])
+    assert [row["session_id"] for row in manager.list_sessions("owner")] == [session_id]
+    manager._sessions[session_id].touched_mono = time.monotonic() - browser_runtime.IDLE_TTL_SECONDS - 1
+    assert manager.list_sessions("owner") == []
+    await manager.sweep()
+    await artifacts.close()
+
+
+@pytest.mark.asyncio
 async def test_absolute_ttl_and_global_capacity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(browser_runtime, "MAX_GLOBAL_SESSIONS", 1)
     manager, artifacts = await fake_manager(tmp_path, monkeypatch)

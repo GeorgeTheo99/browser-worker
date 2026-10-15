@@ -535,7 +535,8 @@ class BrowserManager:
         now = time.monotonic()
         rows: list[dict[str, object]] = []
         for session in self._sessions.values():
-            if session.owner != owner or session.disposed:
+            # An expired session awaiting the sweeper can no longer be opened, so it is not listed.
+            if session.owner != owner or session.disposed or session.expired(now):
                 continue
             pages = self._pages(session)
             active = pages[min(session.active_index, len(pages) - 1)] if pages else None
