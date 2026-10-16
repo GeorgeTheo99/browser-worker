@@ -629,6 +629,13 @@ class BrowserManager:
                     elif kind == "wheel":
                         await page.mouse.move(event["x"], event["y"])
                         await page.mouse.wheel(event["dx"], event["dy"])
+                    elif kind in {"down", "move", "up"}:
+                        # Separate press, move and release let a person hold or drag (press-and-hold checks, sliders).
+                        await page.mouse.move(event["x"], event["y"])
+                        if kind == "down":
+                            await page.mouse.down(button=event["button"])
+                        elif kind == "up":
+                            await page.mouse.up(button=event["button"])
                     elif kind == "key":
                         await page.keyboard.press(event["key"])
                     elif kind == "text":

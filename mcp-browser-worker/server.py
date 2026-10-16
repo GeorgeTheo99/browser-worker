@@ -521,6 +521,9 @@ def parse_live_input(body: Any) -> dict[str, Any]:
     fields: dict[str, set[str]] = {
         "click": {"type", "x", "y", "button", "click_count"},
         "wheel": {"type", "x", "y", "dx", "dy"},
+        "down": {"type", "x", "y", "button"},
+        "move": {"type", "x", "y"},
+        "up": {"type", "x", "y", "button"},
         "key": {"type", "key"},
         "text": {"type", "text"},
         "navigate": {"type", "url"},
@@ -531,7 +534,7 @@ def parse_live_input(body: Any) -> dict[str, Any]:
     if kind not in fields or not set(body) <= fields[kind]:
         raise WorkerError("input event is invalid", code="invalid_request")
     event: dict[str, Any] = {"type": kind}
-    if kind in {"click", "wheel"}:
+    if kind in {"click", "wheel", "down", "move", "up"}:
         event["x"] = _coordinate(body.get("x"), VIEWPORT_WIDTH)
         event["y"] = _coordinate(body.get("y"), VIEWPORT_HEIGHT)
     if kind == "click":
@@ -540,6 +543,11 @@ def parse_live_input(body: Any) -> dict[str, Any]:
         if button not in {"left", "middle", "right"} or clicks not in {1, 2, 3} or isinstance(clicks, bool):
             raise WorkerError("click is invalid", code="invalid_request")
         event.update(button=button, click_count=clicks)
+    elif kind in {"down", "up"}:
+        button = body.get("button", "left")
+        if button not in {"left", "middle", "right"}:
+            raise WorkerError("button is invalid", code="invalid_request")
+        event["button"] = button
     elif kind == "wheel":
         event.update(dx=_delta(body.get("dx", 0)), dy=_delta(body.get("dy", 0)))
     elif kind == "key":

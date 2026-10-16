@@ -94,6 +94,9 @@ def test_download_names_are_sanitized() -> None:
     [
         ({"type": "click", "x": 10, "y": 20}, {"type": "click", "x": 10.0, "y": 20.0, "button": "left", "click_count": 1}),
         ({"type": "wheel", "x": 1, "y": 1, "dy": 400}, {"type": "wheel", "x": 1.0, "y": 1.0, "dx": 0.0, "dy": 400.0}),
+        ({"type": "down", "x": 5, "y": 6}, {"type": "down", "x": 5.0, "y": 6.0, "button": "left"}),
+        ({"type": "move", "x": 7, "y": 8}, {"type": "move", "x": 7.0, "y": 8.0}),
+        ({"type": "up", "x": 9, "y": 10, "button": "right"}, {"type": "up", "x": 9.0, "y": 10.0, "button": "right"}),
         ({"type": "key", "key": "Control+a"}, {"type": "key", "key": "Control+a"}),
         ({"type": "key", "key": "Enter"}, {"type": "key", "key": "Enter"}),
         ({"type": "text", "text": "hello"}, {"type": "text", "text": "hello"}),
@@ -114,6 +117,9 @@ def test_live_input_accepts_bounded_events(body: dict[str, Any], expected: dict[
         {"type": "click", "x": float("nan"), "y": 0},
         {"type": "click", "x": True, "y": 0},
         {"type": "click", "x": 0, "y": 0, "selector": "#a"},
+        {"type": "down", "x": 0, "y": 0, "button": "back"},
+        {"type": "move", "x": 0, "y": 0, "button": "left"},
+        {"type": "up", "y": 0},
         {"type": "key", "key": "a b"},
         {"type": "text", "text": ""},
         {"type": "navigate", "url": "http://127.0.0.1/"},
@@ -191,7 +197,10 @@ async def test_durable_profile_downloads_and_live_takeover(
                 b"<button id=b style='position:fixed;left:0;top:0;width:200px;height:80px' "
                 b"onclick=\"document.title='clicked';document.querySelector('#i').focus()\">Go</button>"
                 b"<input id=i style='position:fixed;left:0;top:100px'>"
-                b"<a id=dl href='/file.csv' style='position:fixed;left:0;top:200px'>download</a></body>"
+                b"<a id=dl href='/file.csv' style='position:fixed;left:0;top:200px'>download</a>"
+                b"<div id=h style='position:fixed;left:0;top:300px;width:400px;height:60px' "
+                b"onmousedown=\"this.dataset.down=event.clientX\" "
+                b"onmouseup=\"this.dataset.up=event.clientX+':'+this.dataset.down\">hold</div></body>"
             )
         writer.write(
             b"HTTP/1.1 200 OK\r\n" + headers + b"Content-Length: " + str(len(body)).encode()
@@ -234,6 +243,11 @@ async def test_durable_profile_downloads_and_live_takeover(
         await manager.human_input("owner", session_id, {"type": "text", "text": "typed by a person"})
         title = await manager.act("owner", session_id, "evaluate", script="[document.title, document.querySelector('#i').value]")
         assert title["result"] == ["clicked", "typed by a person"]
+        await manager.human_input("owner", session_id, {"type": "down", "x": 20.0, "y": 320.0, "button": "left"})
+        await manager.human_input("owner", session_id, {"type": "move", "x": 120.0, "y": 320.0})
+        await manager.human_input("owner", session_id, {"type": "up", "x": 220.0, "y": 320.0, "button": "left"})
+        held = await manager.act("owner", session_id, "evaluate", script="document.querySelector('#h').dataset.up")
+        assert held["result"] == "220:20"
         await events.aclose()
 
         await manager.act("owner", session_id, "click", selector="#dl")
