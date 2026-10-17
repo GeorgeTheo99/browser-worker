@@ -6,6 +6,7 @@ import json
 import logging
 import mimetypes
 import os
+import plistlib
 import re
 import secrets
 import shutil
@@ -115,6 +116,24 @@ def chromium_hardening_args() -> list[str]:
     ]
 
 
+def regular_user_agent(executable: Path) -> str | None:
+    """Chrome's own user agent for this build, without the "HeadlessChrome" that sites treat as a bot.
+
+    Built from the macOS app bundle's version, in Chrome's reduced form; None when it can't be read.
+    """
+    try:
+        info = plistlib.loads((executable.parent.parent / "Info.plist").read_bytes())
+    except (OSError, plistlib.InvalidFileException):
+        return None
+    major = str(info.get("CFBundleShortVersionString") or "").split(".")[0]
+    if not major.isdigit():
+        return None
+    return (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{major}.0.0.0 Safari/537.36"
+    )
+
+
 @dataclass(slots=True)
 class BrowserSession:
     id: str
@@ -179,6 +198,7 @@ class BrowserManager:
         self._starting_profiles: set[tuple[str, str]] = set()
         self._profile_cleanups: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._playwright: Playwright | None = None
+        self._user_agent: str | None = None
         self._sessions: dict[str, BrowserSession] = {}
         self._closed_scopes: dict[tuple[str, str], float] = {}
         self._starting_global = 0
@@ -205,6 +225,8 @@ class BrowserManager:
             elif child.is_dir():
                 shutil.rmtree(child)
         self._playwright = await async_playwright().start()
+        if HEADLESS:
+            self._user_agent = regular_user_agent(Path(BROWSER_EXECUTABLE or self._playwright.chromium.executable_path))
         self._sweeper = asyncio.create_task(self._sweep_loop(), name="browser-worker-sweeper")
 
     async def shutdown(self) -> None:
@@ -279,6 +301,8 @@ class BrowserManager:
         }
         if downloads_dir is not None:
             options["downloads_path"] = str(downloads_dir)
+        if self._user_agent:
+            options["user_agent"] = self._user_agent
         if BROWSER_EXECUTABLE:
             options.pop("channel", None)
             options["executable_path"] = BROWSER_EXECUTABLE

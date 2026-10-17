@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import plistlib
 from pathlib import Path
 
 import pytest
 
 import security
 from artifacts import ArtifactStore
-from browser_runtime import BrowserManager, WorkerError
+from browser_runtime import BrowserManager, WorkerError, regular_user_agent
 from security import PublicResolver, ResolvedTarget
 
 
@@ -228,3 +229,17 @@ async def test_fetch_in_open_session_keeps_it_open(tmp_path: Path, monkeypatch: 
         await artifacts.close()
         server.close()
         await server.wait_closed()
+
+
+def test_regular_user_agent_names_chrome_not_headless_chrome(tmp_path: Path) -> None:
+    contents = tmp_path / "Chromium.app" / "Contents"
+    (contents / "MacOS").mkdir(parents=True)
+    executable = contents / "MacOS" / "Chromium"
+    (contents / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "149.0.7827.55"}))
+    assert regular_user_agent(executable) == (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/149.0.0.0 Safari/537.36"
+    )
+    (contents / "Info.plist").write_bytes(b"not a plist")
+    assert regular_user_agent(executable) is None
+    assert regular_user_agent(tmp_path / "missing" / "MacOS" / "Chromium") is None
