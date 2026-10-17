@@ -240,6 +240,7 @@ def test_regular_user_agent_names_chrome_not_headless_chrome(tmp_path: Path) -> 
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/149.0.0.0 Safari/537.36"
     )
-    (contents / "Info.plist").write_bytes(b"not a plist")
-    assert regular_user_agent(executable) is None
+    for broken in (b"not a plist", b"<?xml version='1.0'?><plist><dict><key>x", plistlib.dumps(["149"])):
+        (contents / "Info.plist").write_bytes(broken)
+        assert regular_user_agent(executable) is None
     assert regular_user_agent(tmp_path / "missing" / "MacOS" / "Chromium") is None

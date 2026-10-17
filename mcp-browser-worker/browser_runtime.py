@@ -123,7 +123,9 @@ def regular_user_agent(executable: Path) -> str | None:
     """
     try:
         info = plistlib.loads((executable.parent.parent / "Info.plist").read_bytes())
-    except (OSError, plistlib.InvalidFileException):
+    except Exception:  # noqa: BLE001 - a missing or malformed bundle keeps Chromium's own user agent
+        return None
+    if not isinstance(info, dict):
         return None
     major = str(info.get("CFBundleShortVersionString") or "").split(".")[0]
     if not major.isdigit():
