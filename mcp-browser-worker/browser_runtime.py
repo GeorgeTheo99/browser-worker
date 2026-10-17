@@ -150,6 +150,18 @@ class BrowserSession:
         return now - self.touched_mono > self.idle_ttl or now - self.created_mono > self.absolute_ttl
 
 
+def _remove_profile_dir(path: Path) -> None:
+    """Delete a durable profile, or fail: a caller told "deleted" must not leave a sign-in on disk."""
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("durable profile delete failed")
+    if path.exists():
+        raise fail("operation_failed")
+
+
 class BrowserManager:
     def __init__(
         self,
@@ -536,7 +548,7 @@ class BrowserManager:
                     async with asyncio.timeout(15):
                         await asyncio.shield(closing)
                 owner_dir = self.profiles_dir / hashlib.sha256(owner.encode("utf-8")).hexdigest()[:32]
-                await asyncio.to_thread(shutil.rmtree, owner_dir / profile, True)
+                await asyncio.to_thread(_remove_profile_dir, owner_dir / profile)
             finally:
                 async with self._state_lock:
                     self._starting_profiles.discard(key)

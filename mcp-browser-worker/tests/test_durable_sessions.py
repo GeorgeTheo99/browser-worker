@@ -108,6 +108,24 @@ async def test_delete_profile_closes_its_session_and_removes_only_that_profile(
 
 
 @pytest.mark.asyncio
+async def test_delete_profile_fails_when_the_profile_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, artifacts = await fake_manager(tmp_path, monkeypatch)
+    await manager.open("owner", None, wait_until="domcontentloaded", timeout_ms=1000, profile="stuck")
+
+    def refuse(path: Path, *args: object, **kwargs: object) -> None:
+        raise PermissionError("held")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(browser_runtime.shutil, "rmtree", refuse)
+        with pytest.raises(WorkerError):
+            await manager.delete_profile("owner", "stuck")
+    await _shutdown_fake(manager)
+    await artifacts.close()
+
+
+@pytest.mark.asyncio
 async def test_delete_profile_needs_the_persistent_capability_and_only_a_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
