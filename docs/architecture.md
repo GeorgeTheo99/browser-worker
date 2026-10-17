@@ -65,6 +65,7 @@ Common fields are optional at the JSON-Schema layer for model compatibility and 
 ### Durable profiles, downloads, and live view
 
 - **Durable profile** (`inspect.persistent`): `open` with `profile` (`^[a-z0-9][a-z0-9_-]{0,63}$`, e.g. `default`) launches Chromium on an owner-only profile directory under `profiles/<sha256(caller)[:32]>/<profile>`. Cookies, storage, and sign-ins persist across sessions and worker restarts. While a session for that caller/profile is live, `open` reattaches to it (`reattached: true`, optional `url` navigates) instead of launching a second browser. Durable sessions are not scope-bound (`scope_id` is rejected), expire after 30 minutes idle or 8 hours total (`BROWSER_WORKER_PERSISTENT_*_TTL_SECONDS`), and their profile is retained on close/expiry; a relaunch waits for the previous context to release the profile. Watching the live view counts as activity. Ephemeral sessions are unchanged. Public-network egress applies identically; a profile is not a credential vault and the worker never exposes cookies or profile files.
+- **Delete a durable profile** (`inspect.persistent`): `delete_profile` with only `profile` closes the caller's live session of that profile, if any, and deletes its directory, so the next `open` starts signed out. It returns `{status:"deleted",profile,closed}`; deleting a profile that doesn't exist succeeds, and an `open` racing the delete gets `session_busy`.
 - **Downloads** (`inspect.download`): sessions opened by such a caller accept downloads into a per-session owner-only directory. Each completed download (≤ 50 MiB, ≤ 300 s, cancelled when the in-flight directory exceeds the cap) becomes an owner-bound artifact with a sanitized `filename` and extension-derived MIME type, served as an attachment with `nosniff` and a sandbox CSP. `downloads` returns at most the 20 latest `{download_id, filename, url, status: in_progress|completed|failed, artifact?, error?}` rows. Download bytes count toward the caller artifact quota and 30-minute artifact TTL; clients must retain them promptly. Without the grant, downloads are cancelled as before.
 - **Live view** (`inspect.live`), plain authenticated HTTP routes beside `/mcp`, owner-bound like artifacts:
   - `GET /sessions` → `{status, sessions:[{session_id, profile, persistent, url, tab_count, idle_expires_in_seconds}]}`.
@@ -129,7 +130,7 @@ Capability tiers:
 | `inspect.artifact` | screenshot/PDF creation and owner-bound retrieval |
 | `inspect.interact` | direct click/type; type's extra Enter press requires `submit=true`, but clicks can activate forms; type results disclose `target_contenteditable` so clients can taint typed page prose |
 | `inspect.script` | page evaluation |
-| `inspect.persistent` | `open` with a durable named `profile` |
+| `inspect.persistent` | `open` with a durable named `profile`, and `delete_profile` |
 | `inspect.download` | accept page downloads as artifacts; `downloads` listing |
 | `inspect.live` | `/sessions` listing, live screencast stream, and human input routes |
 

@@ -511,6 +511,37 @@ class BrowserManager:
                     else:
                         self._starting_by_owner.pop(owner, None)
 
+    async def delete_profile(self, owner: str, profile: str) -> dict[str, object]:
+        """Close the caller's live session of a durable profile, if any, and delete the profile."""
+        if not PROFILE_NAME.fullmatch(profile):
+            raise fail("invalid_request")
+        key = (owner, profile)
+        async with self.operation():
+            async with self._state_lock:
+                if key in self._starting_profiles:
+                    raise fail("session_busy")
+                # Held as "starting" so no open can relaunch the profile while it is deleted.
+                self._starting_profiles.add(key)
+                live = next(
+                    (session for session in self._sessions.values() if session.owner == owner and session.profile == profile),
+                    None,
+                )
+                if live is not None:
+                    self._sessions.pop(live.id, None)
+            try:
+                if live is not None:
+                    await self._dispose_after_action(live)
+                closing = self._profile_cleanups.get(key)
+                if closing is not None:
+                    async with asyncio.timeout(15):
+                        await asyncio.shield(closing)
+                owner_dir = self.profiles_dir / hashlib.sha256(owner.encode("utf-8")).hexdigest()[:32]
+                await asyncio.to_thread(shutil.rmtree, owner_dir / profile, True)
+            finally:
+                async with self._state_lock:
+                    self._starting_profiles.discard(key)
+        return {"status": "deleted", "profile": profile, "closed": live is not None}
+
     def _profile_dir(self, owner: str, profile: str) -> Path:
         # Caller IDs are validated identifiers, but hash them so the on-disk layout
         # never depends on caller-controlled text beyond the validated profile name.

@@ -82,6 +82,63 @@ async def test_durable_profile_uses_long_ttl_and_ephemeral_does_not(
     await artifacts.close()
 
 
+@pytest.mark.asyncio
+async def test_delete_profile_closes_its_session_and_removes_only_that_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, artifacts = await fake_manager(tmp_path, monkeypatch)
+    doomed = await manager.open("owner", None, wait_until="domcontentloaded", timeout_ms=1000, profile="site-a")
+    kept = await manager.open("owner", None, wait_until="domcontentloaded", timeout_ms=1000, profile="site-b")
+    other = await manager.open("other", None, wait_until="domcontentloaded", timeout_ms=1000, profile="site-a")
+    [owner_dir] = [path for path in (tmp_path / "profiles").iterdir() if (path / "site-b").is_dir()]
+
+    assert await manager.delete_profile("owner", "site-a") == {"status": "deleted", "profile": "site-a", "closed": True}
+    assert not (owner_dir / "site-a").exists() and (owner_dir / "site-b").is_dir()
+    assert set(manager._sessions) == {kept["session_id"], other["session_id"]}
+    assert doomed["session_id"] not in manager._sessions
+    # Deleting a profile with no live session (or none at all) succeeds; a bad name does not.
+    assert (await manager.delete_profile("owner", "site-a"))["closed"] is False
+    with pytest.raises(WorkerError):
+        await manager.delete_profile("owner", "../site-b")
+    # A fresh open starts signed out in a new, empty profile.
+    reopened = await manager.open("owner", None, wait_until="domcontentloaded", timeout_ms=1000, profile="site-a")
+    assert reopened["session_id"] != doomed["session_id"] and (owner_dir / "site-a").is_dir()
+    await _shutdown_fake(manager)
+    await artifacts.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_profile_needs_the_persistent_capability_and_only_a_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import auth
+    from auth import Caller
+
+    calls: list[tuple[str, str]] = []
+
+    async def delete_profile(owner: str, profile: str) -> dict[str, object]:
+        calls.append((owner, profile))
+        return {"status": "deleted", "profile": profile, "closed": False}
+
+    monkeypatch.setattr(server.manager, "delete_profile", delete_profile)
+    token = auth._current_caller.set(Caller("reader", frozenset({"inspect.read"})))
+    try:
+        denied = await server.browser_inspect("delete_profile", profile="site-a")
+        assert denied.structured_content["code"] == "capability_denied"
+    finally:
+        auth._current_caller.reset(token)
+    token = auth._current_caller.set(Caller("owner", frozenset({"inspect.read", "inspect.persistent"})))
+    try:
+        for extra in ({}, {"session_id": "s"}, {"url": "https://example.com/"}):
+            result = await server.browser_inspect("delete_profile", **extra)
+            assert result.structured_content["code"] == "invalid_request", extra
+        ok = await server.browser_inspect("delete_profile", profile="site-a")
+        assert ok.structured_content["status"] == "deleted"
+    finally:
+        auth._current_caller.reset(token)
+    assert calls == [("owner", "site-a")]
+
+
 def test_download_names_are_sanitized() -> None:
     assert safe_download_name("../../etc/passwd") == "passwd"
     assert safe_download_name('report "Q3".pdf') == "report _Q3_.pdf"

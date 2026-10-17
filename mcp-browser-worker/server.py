@@ -42,6 +42,7 @@ InspectAction = Literal[
     "state",
     "close",
     "cleanup_scope",
+    "delete_profile",
     "navigate",
     "open_tab",
     "list_tabs",
@@ -250,8 +251,8 @@ async def browser_inspect(
         caller.require("inspect.read")
         timeout = _bounded_timeout(timeout_ms)
         if profile is not None:
-            if action != "open":
-                raise WorkerError("profile is only accepted for open")
+            if action not in {"open", "delete_profile"}:
+                raise WorkerError("profile is only accepted for open and delete_profile")
             caller.require("inspect.persistent")
         if frame_id is not None and action not in FRAME_ACTIONS:
             raise WorkerError("frame_id is unsupported for this action")
@@ -315,6 +316,10 @@ async def browser_inspect(
                     downloads="inspect.download" in caller.capabilities,
                 )
             )
+        if action == "delete_profile":
+            if profile is None or any(value is not None for value in (session_id, scope_id, url)):
+                raise WorkerError("delete_profile accepts only profile")
+            return await _safe_call(manager.delete_profile(caller.id, profile))
         if action == "cleanup_scope":
             if session_id is not None:
                 raise WorkerError("session_id is not accepted for cleanup_scope")
