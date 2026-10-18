@@ -159,36 +159,60 @@ _LAYOUT_SCRIPT = """limit => {
   walk(document);
   return {els, rects, scroll: [scrollX, scrollY], size: [innerWidth, innerHeight], full: els.length < limit};
 }"""
-# Two layouts are the same: the same elements, each where it was.
-_SAME_LAYOUT_SCRIPT = """([a, b]) => a.full && b.full && a.els.length === b.els.length &&
-  a.scroll.every((v, i) => v === b.scroll[i]) && a.size.every((v, i) => v === b.size[i]) &&
-  a.els.every((el, i) => el === b.els[i] && a.rects[i].every((v, j) => v === b.rects[i][j]))"""
-# The element at a point now, through open shadow roots, if the layout had it there (to within a pixel,
-# window unscrolled and unresized); then the control it belongs to. Null otherwise.
-_AT_POINT_SCRIPT = """(layout, [x, y, query]) => {
-  if (scrollX !== layout.scroll[0] || scrollY !== layout.scroll[1] ||
-      innerWidth !== layout.size[0] || innerHeight !== layout.size[1]) return null;
+# The element at a point now, through open shadow roots, if the layouts from just before and just after the
+# screenshot both had it there (to within a pixel, window unscrolled and unresized), and so its control: the
+# nearest control in its composed ancestry (slots included). Null otherwise. Elsewhere the page may move.
+_AT_POINT_SCRIPT = """([before, after, x, y, query]) => {
+  const window_ = l => l.scroll[0] === scrollX && l.scroll[1] === scrollY && l.size[0] === innerWidth && l.size[1] === innerHeight;
+  if (!window_(before) || !window_(after)) return null;
+  const held = el => {
+    const r = el.getBoundingClientRect();
+    return [before, after].every(l => {
+      const index = l.els.indexOf(el);
+      if (index < 0) return false;
+      const [rx, ry, rw, rh] = l.rects[index];
+      return Math.abs(r.x - rx) <= 1 && Math.abs(r.y - ry) <= 1 && Math.abs(r.width - rw) <= 1 && Math.abs(r.height - rh) <= 1;
+    });
+  };
   let el = document.elementFromPoint(x, y);
   for (let inner; el?.shadowRoot && (inner = el.shadowRoot.elementFromPoint(x, y)) && inner !== el;) el = inner;
-  const index = el ? layout.els.indexOf(el) : -1;
-  if (index < 0) return null;
-  const r = el.getBoundingClientRect(), [rx, ry, rw, rh] = layout.rects[index];
-  if (Math.abs(r.x - rx) > 1 || Math.abs(r.y - ry) > 1 || Math.abs(r.width - rw) > 1 || Math.abs(r.height - rh) > 1)
-    return null;
-  for (let n = el; n; n = n.parentElement || (n.getRootNode() instanceof ShadowRoot ? n.getRootNode().host : null))
-    if (n.matches(query)) return n;
+  if (!el || !held(el)) return null;
+  const up = n => n.assignedSlot || n.parentElement || (n.getRootNode() instanceof ShadowRoot ? n.getRootNode().host : null);
+  for (let n = el; n; n = up(n))
+    if (n.matches(query)) return held(n) ? n : null;
   return el;
 }"""
-# What an element is: its own label, what it shows on screen and tells screen readers apart (a page can make
-# them differ), never a field's value.
+# What an element is: what it shows on screen (its rendered text through shadow roots and slots, a button
+# input's value, title, or alt; never a field's value) and what it tells screen readers (`aria_unknown` when
+# its aria-labelledby names nothing that can be read), which a page can make differ.
 _AT_POINT_ROW = """el => {""" + _DOM_HELPERS + """
-  const aria = (el.getAttribute('aria-label') || (el.getAttribute('aria-labelledby') || '').split(/\\s+/).slice(0, 6)
-    .map(id => text(document.getElementById(id))).join(' ')).trim().slice(0, 200);
+  const skip = n => n.matches('input,textarea,select,script,style,[contenteditable]:not([contenteditable="false"])');
+  const rendered = root => {
+    const out = []; let count = 0, length = 0;
+    const visit = n => {
+      if (count++ > 600 || length > 200) return;
+      if (n.nodeType === 3) { const t = n.textContent.trim(); if (t) { out.push(t); length += t.length; } return; }
+      if (n.nodeType !== 1 || skip(n)) return;
+      if (n.localName === 'slot') {
+        const assigned = n.assignedNodes({flatten: true});
+        for (const c of assigned.length ? assigned : n.childNodes) visit(c);
+        return;
+      }
+      if (!n.checkVisibility() && getComputedStyle(n).display !== 'contents') return;
+      for (const c of (n.shadowRoot ? n.shadowRoot.childNodes : n.childNodes)) visit(c);
+    };
+    if (root.isContentEditable || skip(root)) return '';
+    visit(root);
+    return out.join(' ').replace(/\\s+/g, ' ').slice(0, 200);
+  };
+  const ids = (el.getAttribute('aria-labelledby') || '').split(/\\s+/).filter(Boolean).slice(0, 6);
+  const named = ids.map(id => el.getRootNode().getElementById?.(id) || document.getElementById(id)).filter(Boolean);
+  const aria = (el.getAttribute('aria-label') || named.map(rendered).join(' ')).replace(/\\s+/g, ' ').trim().slice(0, 200);
   const own = el.matches('input[type=submit],input[type=button],input[type=reset]') ? el.value : '';
-  const shown = (text(el) || own || el.getAttribute('title') || el.getAttribute('alt') || '').trim().slice(0, 200);
+  const shown = (rendered(el) || own || el.getAttribute('title') || el.getAttribute('alt') || '').trim().slice(0, 200);
   return {tag: el.tagName.toLowerCase(), role: (el.getAttribute('role') || '').slice(0, 100),
-    label: label(el).slice(0, 500), shown, aria, type: (el.getAttribute('type') || '').slice(0, 100),
-    href: (el.matches('a[href]') ? el.href : '').slice(0, 8192)};
+    label: label(el).slice(0, 500), shown, aria, aria_unknown: !el.getAttribute('aria-label') && ids.length > 0 && !aria,
+    type: (el.getAttribute('type') || '').slice(0, 100), href: (el.matches('a[href]') ? el.href : '').slice(0, 8192)};
 }"""
 _CONTROL_QUERY = 'a[href],button,input:not([type="hidden"]),textarea,select,summary,label,[role],[tabindex],[onclick],[contenteditable="true"]'
 
@@ -226,7 +250,7 @@ class BrowserSession:
     ref_seq: int = 0
     # Layouts of tracked screenshots (newest last): which element was where, so `elements` at a point of
     # one can check that the element there now is the one the screenshot showed.
-    captures: dict[str, tuple[Page, JSHandle]] = field(default_factory=dict)
+    captures: dict[str, tuple[Page, JSHandle, JSHandle]] = field(default_factory=dict)
 
     @property
     def persistent(self) -> bool:
@@ -543,29 +567,20 @@ class BrowserManager:
                 raise fail("point_in_frame")
 
     async def _track_layout(self, session: BrowserSession, page: Page, capture: Any) -> tuple[Any, str | None]:
-        """Run `capture` (a screenshot) and remember which element was where while it ran: the layout must be
-        the same just before and just after, else no capture_id (the page was changing)."""
-        data = before = after = None
-        steady = False
+        """Run `capture` (a screenshot) and remember which element was where just before and just after it."""
+        before = await page.main_frame.evaluate_handle(_LAYOUT_SCRIPT, MAX_LAYOUT_ELEMENTS)
         try:
-            before = await page.main_frame.evaluate_handle(_LAYOUT_SCRIPT, MAX_LAYOUT_ELEMENTS)
             data = await capture()
             after = await page.main_frame.evaluate_handle(_LAYOUT_SCRIPT, MAX_LAYOUT_ELEMENTS)
-            steady = bool(await page.main_frame.evaluate(_SAME_LAYOUT_SCRIPT, [before, after]))
-        except BrowserError:
-            pass  # no capture_id; a failed capture leaves no data
-        finally:
-            if before is not None:
-                await self._release(before)
-        if not steady:
-            if after is not None:
-                await self._release(after)
-            return data, None
+        except BaseException:
+            await self._release(before)
+            raise
         capture_id = secrets.token_urlsafe(12)
-        session.captures[capture_id] = (page, after)
+        session.captures[capture_id] = (page, before, after)
         while len(session.captures) > MAX_TRACKED_CAPTURES:
-            _, old = session.captures.pop(next(iter(session.captures)))
-            await self._release(old)
+            _, *old = session.captures.pop(next(iter(session.captures)))
+            for handle in old:
+                await self._release(handle)
         return data, capture_id
 
     @staticmethod
@@ -586,7 +601,7 @@ class BrowserManager:
         if captured is None or captured[0] is not page:
             raise fail("stale_capture")
         try:
-            found = await captured[1].evaluate_handle(_AT_POINT_SCRIPT, [x, y, _CONTROL_QUERY])
+            found = await page.main_frame.evaluate_handle(_AT_POINT_SCRIPT, [captured[1], captured[2], x, y, _CONTROL_QUERY])
         except BrowserError as exc:  # its document is gone
             raise fail("stale_capture") from exc
         element = found.as_element()
@@ -1504,8 +1519,6 @@ class BrowserManager:
                             data, capture_id = await self._track_layout(
                                 session, page, lambda: page.screenshot(full_page=False, type="png"),
                             )
-                            if data is None:
-                                raise WorkerError("screenshot failed")
                         else:
                             data = await page.screenshot(full_page=full_page, type="png")
                     except WorkerError:

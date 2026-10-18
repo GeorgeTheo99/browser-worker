@@ -541,8 +541,44 @@ async def test_elements_at_a_point_of_a_tracked_screenshot_gives_the_control_it_
         assert (await call(sid, "elements", x=50, y=20))["code"] == "invalid_request"
         assert (await call(sid, "elements", x=50, y=20, capture_id=capture, text="add"))["code"] == "invalid_request"
         assert (await call(sid, "screenshot", track=True)).get("capture_id") is None  # a full page isn't tracked
-        # A page that keeps moving while it is captured gives no capture to point in.
+        # Something moving elsewhere doesn't matter; the target moving does.
         await page.evaluate("setInterval(() => document.querySelector('#under').style.left = (500 + Math.random() * 50) + 'px', 0)")
-        assert "capture_id" not in await call(sid, "screenshot", full_page=False, track=True)
+        capture = await track()
+        assert (await call(sid, "elements", x=50, y=20, capture_id=capture))["elements"][0]["shown"] == "Delete"
+        assert (await call(sid, "elements", x=510, y=20, capture_id=capture))["code"] == "stale_capture"
+    finally:
+        auth._current_caller.reset(token)
+
+
+@pytest.mark.browser
+async def test_elements_at_a_point_reads_web_components_as_they_render(browser):
+    _, sid, page, _, _ = browser
+    await page.evaluate('''() => {
+      document.body.style.margin = 0;
+      document.body.innerHTML = '<my-row id=row style="position:absolute;left:0;top:0"><span id=slotted>Add to Cart</span></my-row>' +
+        '<div id=labelled style="position:absolute;left:0;top:100px"></div>' +
+        '<div id=host role=button style="position:absolute;left:0;top:200px">Add to Cart</div>';
+      // A slotted span inside a shadow button that says otherwise.
+      document.querySelector('#row').attachShadow({mode: 'open'}).innerHTML =
+        '<button aria-label="Delete account" style="width:200px;height:40px"><slot></slot></button>';
+      // A shadow button labelled by an element of its own shadow root.
+      document.querySelector('#labelled').attachShadow({mode: 'open'}).innerHTML =
+        '<span id=name style="display:block">Delete account</span><button aria-labelledby=name style="width:200px;height:40px">Go</button>';
+      // A shadow host rendering other words than its (unslotted) light DOM.
+      document.querySelector('#host').attachShadow({mode: 'open'}).innerHTML =
+        '<b style="display:block;width:200px;height:40px">Remove everything</b>';
+    }''')
+    token = auth._current_caller.set(Caller("research", frozenset({"inspect.read", "inspect.artifact"})))
+    try:
+        capture = (await call(sid, "screenshot", full_page=False, track=True))["capture_id"]
+        [slotted] = (await call(sid, "elements", x=50, y=20, capture_id=capture))["elements"]
+        assert (slotted["tag"], slotted["aria"], slotted["shown"]) == ("button", "Delete account", "Add to Cart")
+        [labelled] = (await call(sid, "elements", x=50, y=125, capture_id=capture))["elements"]
+        assert (labelled["aria"], labelled["shown"], labelled["aria_unknown"]) == ("Delete account", "Go", False)
+        [host] = (await call(sid, "elements", x=50, y=220, capture_id=capture))["elements"]
+        assert (host["tag"], host["shown"]) == ("div", "Remove everything")  # what renders, not the hidden light DOM
+        await page.evaluate("document.querySelector('#labelled').shadowRoot.querySelector('button').setAttribute('aria-labelledby', 'nowhere')")
+        [unknown] = (await call(sid, "elements", x=50, y=125, capture_id=capture))["elements"]
+        assert unknown["aria"] == "" and unknown["aria_unknown"]
     finally:
         auth._current_caller.reset(token)
