@@ -19,6 +19,9 @@ ERROR_MESSAGES = {
     "blocked_access": "page access is blocked; do not attempt to bypass the restriction",
     "artifact_error": "browser artifact is unavailable",
     "session_busy": "browser session is busy; try again shortly",
+    "stale_ref": "element reference is unknown or gone from the page; list elements again",
+    "point_outside": "that point is outside the visible page",
+    "point_in_frame": "that point is inside an embedded frame; use frames and frame_id",
 }
 
 

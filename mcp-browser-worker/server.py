@@ -64,6 +64,7 @@ InspectAction = Literal[
     "screenshot",
     "export_pdf",
     "click",
+    "click_at",
     "type",
     "evaluate",
 ]
@@ -208,6 +209,14 @@ async def browser_fetch(
     )
 
 
+def _target_params(params: dict[str, Any], selector: str | None, ref: str | None) -> None:
+    """An action's element: a `ref` from `elements`, or else a selector."""
+    if ref is not None:
+        params["ref"] = ref
+    else:
+        params["selector"] = _bounded_text(selector, name="selector", maximum=2000, required=True)
+
+
 @mcp.tool()
 async def browser_inspect(
     action: InspectAction,
@@ -215,6 +224,9 @@ async def browser_inspect(
     scope_id: Annotated[str | None, Field(max_length=128)] = None,
     url: Annotated[str | None, Field(max_length=8192)] = None,
     selector: Annotated[str | None, Field(max_length=2000)] = None,
+    ref: Annotated[str | None, Field(pattern=r"^e[1-9][0-9]{0,8}$")] = None,
+    x: Annotated[float | None, Field(ge=0, le=3840)] = None,
+    y: Annotated[float | None, Field(ge=0, le=2160)] = None,
     frame_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
     control_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
     option: Annotated[str | None, Field(min_length=1, max_length=200)] = None,
@@ -245,6 +257,10 @@ async def browser_inspect(
     `open` with `profile` reattaches to (or launches) a durable named browser profile whose
     cookies and sign-ins persist across sessions; without it, the session is ephemeral.
     `downloads` lists files the page downloaded, each retrievable as an artifact.
+    `elements` gives each listed element a short `ref` (e.g. `e12`) that `click`, `type` and `screenshot`
+    accept instead of a selector; `text` keeps elements whose label or nearby text contains it, and
+    `selector` lists only inside the elements it matches. `click_at` clicks the point `x`,`y` of the
+    visible page, in the CSS pixels of a screenshot with `full_page` false.
     """
     caller = current_caller()
     try:
@@ -256,6 +272,10 @@ async def browser_inspect(
             caller.require("inspect.persistent")
         if frame_id is not None and action not in FRAME_ACTIONS:
             raise WorkerError("frame_id is unsupported for this action")
+        if ref is not None and (action not in {"click", "type", "screenshot"} or selector is not None or frame_id is not None):
+            raise WorkerError("ref replaces selector and frame_id for click, type and screenshot")
+        if (x is not None or y is not None) != (action == "click_at") or (action == "click_at" and None in (x, y)):
+            raise WorkerError("x and y are required for click_at and accepted only there")
         if frame_id is not None:
             _bounded_text(frame_id, name="frame_id", maximum=128, required=True)
         if action in {"prepare_action", "execute_prepared", "discard_prepared"}:
@@ -377,18 +397,28 @@ async def browser_inspect(
             params["tab_index"] = tab_index
         elif action == "extract_text" or action == "extract_links":
             params["selector"] = _bounded_text(selector, name="selector", maximum=2000)
+        elif action == "elements":
+            params["text"] = _bounded_text(text, name="text", maximum=200)
+            params["selector"] = _bounded_text(selector, name="selector", maximum=2000)
         elif action == "click":
             caller.require("inspect.interact")
-            params["selector"] = _bounded_text(selector, name="selector", maximum=2000, required=True)
+            _target_params(params, selector, ref)
+        elif action == "click_at":
+            caller.require("inspect.interact")
+            if not (math.isfinite(x) and math.isfinite(y)):  # type: ignore[arg-type]
+                raise WorkerError("x and y must be finite")
+            params["x"], params["y"] = x, y
         elif action == "type":
             caller.require("inspect.interact")
-            params["selector"] = _bounded_text(selector, name="selector", maximum=2000, required=True)
+            _target_params(params, selector, ref)
             params["text"] = _bounded_text(text, name="text", maximum=20_000, required=True)
         elif action == "wait":
             params["selector"] = _bounded_text(selector, name="selector", maximum=2000)
             params["url_contains"] = _bounded_text(url_contains, name="url_contains", maximum=2000)
         elif action in {"screenshot", "export_pdf"}:
             caller.require("inspect.artifact")
+            if action == "screenshot" and (selector is not None or ref is not None):
+                _target_params(params, selector, ref)
         elif action == "downloads":
             caller.require("inspect.download")
         elif action == "evaluate":

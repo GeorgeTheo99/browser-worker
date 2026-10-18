@@ -151,14 +151,25 @@ _PREFLIGHT = r"""(saved, args) => {
   return {error: guard()};
 }"""
 
-_ELEMENTS = r"""limit => {
+_ELEMENTS = r"""args => {
 """ + _DOM_HELPERS + r"""
-  const candidates = document.querySelectorAll('a[href],button,input:not([type="hidden"]),textarea,select,label,[role],[tabindex],[contenteditable="true"]');
-  const elements = [];
-  let scanned = 0;
+  const query = 'a[href],button,input:not([type="hidden"]),textarea,select,label,[role],[tabindex],[contenteditable="true"]';
+  let roots;
+  try { roots = args.within ? [...document.querySelectorAll(args.within)] : [document.documentElement]; }
+  catch { return {invalid: true}; }
+  if (!roots.length) return {missing: true};
+  const seen = new Set(), candidates = [];
+  for (const root of roots)
+    for (const el of [root, ...root.querySelectorAll(query)])
+      if (!seen.has(el) && el.matches(query)) { seen.add(el); candidates.push(el); }
+  const needle = (args.text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const chrome = 'header,nav,footer,[role="banner"],[role="navigation"],[role="contentinfo"]';
+  const found = [], twins = new Map();
+  let scanned = 0, skipped = false;
   for (const el of candidates) {
-    if (scanned++ >= 500 || elements.length >= limit) break;
+    if (scanned++ >= 3000) { skipped = true; break; }
     if (!visible(el)) continue;
+    const own = label(el).slice(0, 500);
     // Structural CSS only: no value attributes or text-selector interpolation.
     const parts = []; let n = el;
     while (n && n !== document.documentElement && parts.length < 32) {
@@ -170,26 +181,80 @@ _ELEMENTS = r"""limit => {
     if (n !== document.documentElement) continue;
     const selector = 'html > ' + parts.join(' > ');
     if (selector.length > 2000 || document.querySelectorAll(selector).length !== 1) continue;
-    elements.push({selector, tag: el.tagName.toLowerCase(), role: (el.getAttribute('role') || '').slice(0,100),
-      label: label(el).slice(0,500), type: (el.getAttribute('type') || '').slice(0,100),
-      href: (el.matches('a[href]') ? el.href : '').slice(0,8192)});
+    const key = own.toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!twins.has(key)) twins.set(key, []);
+    twins.get(key).push(el);
+    found.push({el, own, key, selector});
   }
-  return {elements, truncated: scanned < candidates.length};
+  // Several "Delete" buttons: each one's nearby text (its cart row) says which item it acts on. That is the
+  // largest block around it holding no other element of the same label.
+  const near = (el, same) => {
+    let best = null;
+    for (let n = el.parentElement; n && n !== document.body; n = n.parentElement) {
+      if (same.some(other => other !== el && n.contains(other))) break;
+      best = n;
+    }
+    return best ? (best.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 160) : '';
+  };
+  const main = [], aside = [];
+  for (const row of found) {
+    const same = twins.get(row.key);
+    row.around = same.length > 1 ? near(row.el, same) : '';
+    if (needle && !row.key.includes(needle) && !row.around.toLowerCase().includes(needle)) continue;
+    // Page furniture (site header, menus, footer) goes after the page's own content.
+    (row.el.closest(chrome) ? aside : main).push(row);
+  }
+  const kept = [...main, ...aside];
+  const limit = Math.min(args.limit, kept.length);
+  const rows = [], els = [];
+  for (const {el, own, around, selector} of kept.slice(0, limit)) {
+    rows.push({selector, tag: el.tagName.toLowerCase(), role: (el.getAttribute('role') || '').slice(0,100),
+      label: own, type: (el.getAttribute('type') || '').slice(0,100),
+      href: (el.matches('a[href]') ? el.href : '').slice(0,8192),
+      ...(around && around !== own ? {near: around} : {})});
+    els.push(el);
+  }
+  return {rows, els, truncated: skipped || kept.length > limit};
 }"""
 
 
-async def discover_elements(page: Page | Frame, limit: int) -> dict[str, Any]:
+async def discover_elements(
+    page: Page | Frame, limit: int, *, text: str | None = None, within: str | None = None,
+) -> tuple[dict[str, Any], list[ElementHandle]]:
+    """List visible interactive elements, the page's own content before its header and menus.
+
+    `text` keeps those whose label or surrounding text contains it; `within` lists only inside
+    the elements a selector matches. Returns the rows and a handle to each row's element.
+    """
     try:
         async with asyncio.timeout(3):
             await check_access(page)
-            result = await page.evaluate(_ELEMENTS, min(100, max(1, limit)))
-            for row in result['elements']:
+            found = await page.evaluate_handle(
+                _ELEMENTS, {"limit": min(100, max(1, limit)), "text": text or "", "within": within or ""}
+            )
+            try:
+                result = await found.evaluate("r => ({rows: r.rows, truncated: r.truncated, invalid: !!r.invalid, missing: !!r.missing})")
+                if result['invalid']:
+                    raise fail('invalid_selector')
+                if result['missing']:
+                    raise fail('selector_not_found')
+                array = await found.get_property('els')
+                try:
+                    listed = await array.get_properties()
+                finally:
+                    await array.dispose()
+                handles = [listed[str(index)].as_element() for index in range(len(result['rows']))]
+            finally:
+                await found.dispose()
+            if any(handle is None for handle in handles):
+                raise fail('operation_failed')
+            for row in result['rows']:
                 if row['href']:
                     try:
                         parse_public_url(row['href'])
                     except NetworkPolicyError:
                         row['href'] = ''
-            return result
+            return {'elements': result['rows'], 'truncated': result['truncated']}, handles  # type: ignore[return-value]
     except (TimeoutError, BrowserTimeoutError) as exc:
         raise fail('extraction_timeout') from exc
     except Error as exc:

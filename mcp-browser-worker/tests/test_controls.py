@@ -377,3 +377,89 @@ async def test_click_and_type_use_the_only_visible_match_and_say_why_otherwise(b
         assert (await call(sid, "click", selector="#nothing", timeout_ms=1000))["code"] == "selector_not_found"
     finally:
         auth._current_caller.reset(token)
+
+
+CART = '''() => {
+  document.body.innerHTML = `<header><nav>${Array.from({length: 120}, (_, i) => `<a href="/n${i}">Menu ${i}</a>`).join('')}</nav></header>
+    <main><div class=row><a href="/dp/1">511 Impregnator Sealer, one quart bottle</a><span><button class=del>Delete</button></span></div>
+    <div class=row><a href="/dp/2">MB-11 Marble Etch Remover Kit with polishing pads</a><span><button class=del>Delete</button></span></div>
+    <input id=qty aria-label=Quantity></main>`;
+  window.deleted = [];
+  document.querySelectorAll('.del').forEach((b, i) => b.onclick = () => window.deleted.push(i));
+}'''
+
+
+@pytest.mark.browser
+async def test_elements_lists_page_content_first_with_refs_text_and_nearby_context(browser):
+    _, sid, page, _, _ = browser
+    await page.evaluate(CART)
+    listed = await call(sid, "elements")
+    assert listed["status"] == "ok" and listed["truncated"]
+    assert [row["label"] for row in listed["elements"][:5]] == [
+        "511 Impregnator Sealer, one quart bottle", "Delete", "MB-11 Marble Etch Remover Kit with polishing pads",
+        "Delete", "Quantity"]
+    assert listed["elements"][5]["label"] == "Menu 0"
+    refs = [row["ref"] for row in listed["elements"]]
+    assert refs[:3] == ["e1", "e2", "e3"] and len(set(refs)) == len(refs)
+    assert "511 Impregnator" in listed["elements"][1]["near"]
+    assert "near" not in listed["elements"][0] or listed["elements"][0]["near"] != listed["elements"][0]["label"]
+
+    scoped = await call(sid, "elements", selector="main .row:nth-of-type(1)")
+    assert [row["label"] for row in scoped["elements"]] == ["511 Impregnator Sealer, one quart bottle", "Delete"]
+    found = await call(sid, "elements", text="mb-11")
+    assert [row["label"] for row in found["elements"]] == ["MB-11 Marble Etch Remover Kit with polishing pads", "Delete"]
+    assert not found["truncated"]
+    # A failed listing keeps the refs of the last one.
+    assert (await call(sid, "elements", selector=".absent"))["code"] == "selector_not_found"
+    assert (await call(sid, "elements", selector="##bad"))["code"] == "invalid_selector"
+
+    token = auth._current_caller.set(Caller("research", frozenset({"inspect.read", "inspect.interact"})))
+    try:
+        delete = next(row["ref"] for row in found["elements"] if row["label"] == "Delete")
+        clicked = await call(sid, "click", ref=delete)
+        assert clicked["status"] == "ok", clicked
+        assert await page.evaluate("window.deleted") == [1]
+        # An earlier listing's refs stop working; refs never repeat, so none means another element.
+        assert (await call(sid, "click", ref=listed["elements"][1]["ref"]))["code"] == "stale_ref"
+        assert (await call(sid, "click", ref="e999999"))["code"] == "stale_ref"
+        qty = next(row["ref"] for row in (await call(sid, "elements", text="quantity"))["elements"])
+        assert (await call(sid, "type", ref=qty, text="3"))["status"] == "ok"
+        assert await page.locator("#qty").input_value() == "3"
+        await page.evaluate("document.querySelector('#qty').replaceWith(document.querySelector('#qty').cloneNode())")
+        assert (await call(sid, "type", ref=qty, text="4"))["code"] == "stale_ref"
+        assert (await call(sid, "click", ref=qty, selector="#qty"))["code"] == "invalid_request"
+        assert (await call(sid, "extract_text", ref=qty))["code"] == "invalid_request"
+    finally:
+        auth._current_caller.reset(token)
+
+
+@pytest.mark.browser
+async def test_click_at_clicks_a_visible_point_and_says_what_it_hit(browser):
+    _, sid, page, _, _ = browser
+    await page.evaluate('''() => {
+      document.body.style.margin = 0;
+      document.body.innerHTML = '<button id=go style="position:absolute;left:100px;top:200px;width:80px;height:40px">Go</button>' +
+        '<iframe style="position:absolute;left:300px;top:200px;width:100px;height:100px"></iframe>' +
+        '<label style="position:absolute;left:500px;top:200px">Upload<input type=file></label>' +
+        '<div id=far style="position:absolute;top:3000px">Far</div>';
+      window.clicks = 0; document.querySelector('#go').onclick = () => window.clicks++;
+    }''')
+    token = auth._current_caller.set(Caller("research", frozenset({"inspect.read", "inspect.interact", "inspect.artifact"})))
+    try:
+        shot = await call(sid, "screenshot", full_page=False)
+        assert shot["viewport"] == {"width": 1440, "height": 900}
+        clicked = await call(sid, "click_at", x=140, y=220)
+        assert clicked["status"] == "ok" and clicked["clicked"] == {"tag": "button", "label": "Go"}
+        assert await page.evaluate("window.clicks") == 1
+        assert (await call(sid, "click_at", x=350, y=250))["code"] == "point_in_frame"
+        assert (await call(sid, "click_at", x=510, y=205))["code"] == "approval_unavailable"
+        assert (await call(sid, "click_at", x=1439, y=1000))["code"] == "point_outside"
+        assert (await call(sid, "click_at", x=140))["code"] == "invalid_request"
+        assert (await call(sid, "click", selector="#go", x=1, y=1))["code"] == "invalid_request"
+        # A screenshot of an element scrolls it into view and captures the visible page.
+        far = await call(sid, "screenshot", selector="#far")
+        assert far["status"] == "ok" and far["viewport"]["height"] == 900
+        assert await page.evaluate("scrollY") > 2000
+        assert "viewport" not in await call(sid, "screenshot")
+    finally:
+        auth._current_caller.reset(token)

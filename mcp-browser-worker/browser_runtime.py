@@ -33,7 +33,7 @@ from patchright.async_api import (
 )
 from patchright.async_api import TimeoutError as BrowserTimeoutError
 
-from approvals import ApprovalStore, discover_elements
+from approvals import _DOM_HELPERS, ApprovalStore, discover_elements
 from artifacts import ArtifactStore
 from config import (
     ABSOLUTE_TTL_SECONDS,
@@ -163,6 +163,9 @@ class BrowserSession:
     downloads: list[dict[str, object]] = field(default_factory=list)
     tasks: set[asyncio.Task[None]] = field(default_factory=set)
     live: LiveView = field(default_factory=LiveView)
+    # Short element references from the latest `elements` listing, each bound to its exact element.
+    refs: dict[str, ElementHandle] = field(default_factory=dict)
+    ref_seq: int = 0
 
     @property
     def persistent(self) -> bool:
@@ -375,6 +378,76 @@ class BrowserManager:
         if element is None:
             raise fail("selector_not_found")
         return element
+
+    async def _replace_refs(self, session: BrowserSession, rows: list[dict[str, Any]], handles: list[ElementHandle]) -> None:
+        """Bind each listed row to a new short reference; references from earlier listings stop working.
+
+        References never repeat within a session, so an old one can't silently mean a different element."""
+        old = list(session.refs.values())
+        session.refs = {}
+        for row, handle in zip(rows, handles, strict=True):
+            session.ref_seq += 1
+            row["ref"] = f"e{session.ref_seq}"
+            session.refs[row["ref"]] = handle
+        for handle in old:
+            try:
+                await handle.dispose()
+            except Exception:  # its page may be gone
+                logger.debug("element reference already released", exc_info=True)
+
+    async def _target(
+        self, session: BrowserSession, page: Page, frame: Frame, params: dict[str, Any], timeout_ms: int,
+    ) -> tuple[Frame, ElementHandle, bool]:
+        """The element an action goes to, its frame, and whether the caller must release its handle."""
+        ref = params.get("ref")
+        if ref is None:
+            await check_frame_access(page, frame)
+            return frame, await self._one_target(frame, str(params["selector"]), timeout_ms), True
+        element = session.refs.get(str(ref))
+        if element is None:
+            raise fail("stale_ref")
+        try:
+            owner_frame = await element.owner_frame()
+            # Same node, still in its document, in this tab: never a look-alike that replaced it.
+            connected = owner_frame is not None and await element.evaluate(
+                "el => el.isConnected && el.ownerDocument === document"
+            )
+        except BrowserError:
+            connected = False
+        if not connected or owner_frame is None:
+            raise fail("stale_ref")
+        try:
+            await check_frame_access(page, owner_frame)
+        except WorkerError as exc:
+            if exc.code == "approval_stale":  # another tab's or a detached frame's element
+                raise fail("stale_ref") from exc
+            raise
+        return owner_frame, element, False
+
+    async def _click_at(self, session: BrowserSession, page: Page, x: float, y: float) -> dict[str, object]:
+        """Click a point of the visible page (CSS pixels, as in a screenshot of it), and say what it hit."""
+        await check_frame_access(page, page.main_frame)
+        hit = await page.evaluate_handle(
+            "([x, y]) => (x < innerWidth && y < innerHeight) ? document.elementFromPoint(x, y) : null", [x, y]
+        )
+        element = hit.as_element()
+        if element is None:
+            await hit.dispose()
+            raise fail("point_outside")
+        try:
+            target = await element.evaluate(
+                "el => {" + _DOM_HELPERS + "return {tag: el.tagName.toLowerCase(), label: label(el).slice(0, 200)}; }"
+            )
+            if target["tag"] in {"iframe", "frame"}:
+                raise fail("point_in_frame")
+            await self._no_upload(element)
+        finally:
+            await element.dispose()
+        try:
+            await page.mouse.click(x, y)
+        except Exception as exc:
+            raise WorkerError("click failed") from exc
+        return {**await self._state(session), "clicked": target}
 
     async def _no_passkey_prompt(self, page: Page) -> None:
         """Turn off Chrome's passkey prompt. A headless page can't show it, yet it takes the keyboard:
@@ -997,7 +1070,10 @@ class BrowserManager:
                     return {"status": "ok", "session_id": session.id, **result}
                 if action == "elements":
                     await check_frame_access(page, frame)
-                    result = await discover_elements(frame, int(params.get("limit") or 50))
+                    result, handles = await discover_elements(
+                        frame, int(params.get("limit") or 50), text=params.get("text"), within=params.get("selector")
+                    )
+                    await self._replace_refs(session, result["elements"], handles)
                     return {"status": "ok", "session_id": session.id, **result}
                 if action in {"prepare_action", "execute_prepared", "discard_prepared"} and (
                     self._sessions.get(session_id) is not session or session.disposed
@@ -1149,15 +1225,15 @@ class BrowserManager:
                     return {"status": "ok", "session_id": session.id, "links": links}
                 if action == "click":
                     try:
-                        await check_frame_access(page, frame)
-                        element = await self._one_target(frame, str(params["selector"]), timeout_ms)
+                        frame, element, owned = await self._target(session, page, frame, params, timeout_ms)
                         try:
                             if await element.owner_frame() != frame:
                                 raise fail("invalid_request")
                             await self._no_upload(element)
                             await element.click(timeout=timeout_ms)
                         finally:
-                            await element.dispose()
+                            if owned:
+                                await element.dispose()
                     except WorkerError:
                         raise
                     except Exception as exc:
@@ -1165,10 +1241,10 @@ class BrowserManager:
                     return await self._state(session)
                 if action == "type":
                     element = None
+                    owned = True
                     editable = True
                     try:
-                        await check_frame_access(page, frame)
-                        element = await self._one_target(frame, str(params["selector"]), timeout_ms)
+                        frame, element, owned = await self._target(session, page, frame, params, timeout_ms)
                         if await element.owner_frame() != frame:
                             raise fail("invalid_request")
                         await self._no_upload(element)
@@ -1186,9 +1262,11 @@ class BrowserManager:
                     except Exception as exc:
                         raise WorkerError("typing failed") from exc
                     finally:
-                        if element is not None:
+                        if element is not None and owned:
                             await element.dispose()
                     return {"status": "ok", "session_id": session.id, "url": frame.url, "target_contenteditable": editable}
+                if action == "click_at":
+                    return await self._click_at(session, page, float(params["x"]), float(params["y"]))
                 if action == "wait":
                     await check_frame_access(page, frame)
                     selector = params.get("selector")
@@ -1214,13 +1292,29 @@ class BrowserManager:
                             raise WorkerError("wait condition was not met") from exc
                     return await self._state(session)
                 if action == "screenshot":
+                    full_page = bool(params.get("full_page", True))
+                    if params.get("ref") or params.get("selector"):
+                        # Show that element: scroll it into the visible page, then capture what's visible.
+                        full_page = False
+                        frame, element, owned = await self._target(session, page, frame, params, timeout_ms)
+                        try:
+                            await element.scroll_into_view_if_needed(timeout=timeout_ms)
+                        except Exception as exc:
+                            raise WorkerError("screenshot failed") from exc
+                        finally:
+                            if owned:
+                                await element.dispose()
                     await self._ensure_capture_bounds(page)
                     try:
-                        data = await page.screenshot(full_page=bool(params.get("full_page", True)), type="png")
+                        data = await page.screenshot(full_page=full_page, type="png")
                     except Exception as exc:
                         raise WorkerError("screenshot failed") from exc
                     record = await self.artifacts.create(owner, data, suffix="png", mime_type="image/png", max_bytes=MAX_SCREENSHOT_BYTES)
-                    return {"status": "ok", "session_id": session.id, "artifact": record.public()}
+                    result = {"status": "ok", "session_id": session.id, "artifact": record.public()}
+                    if not full_page:
+                        # click_at takes points in this capture: CSS pixels of the visible page.
+                        result["viewport"] = await page.evaluate("() => ({width: innerWidth, height: innerHeight})")
+                    return result
                 if action == "export_pdf":
                     await self._ensure_capture_bounds(page)
                     try:
