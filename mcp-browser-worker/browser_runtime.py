@@ -327,6 +327,7 @@ class BrowserManager:
         if page in session.tracked_pages:
             return
         session.tracked_pages.add(page)
+        self._spawn(session, self._no_passkey_prompt(page), f"browser-no-passkey-prompt-{session.id}")
         session.approvals.invalidate()
         page.on("framenavigated", lambda frame: session.approvals.invalidate() if frame == page.main_frame else None)
         page.on("close", session.approvals.invalidate)
@@ -353,6 +354,15 @@ class BrowserManager:
 
         page.on("console", on_console)
         page.on("download", lambda download: self._on_download(session, download))
+
+    async def _no_passkey_prompt(self, page: Page) -> None:
+        """Turn off Chrome's passkey prompt. A headless page can't show it, yet it takes the keyboard:
+        Amazon's password page asks for a passkey on load, and then no key (nor Enter) reaches the page."""
+        try:
+            cdp = await page.context.new_cdp_session(page)
+            await cdp.send("WebAuthn.enable", {"enableUI": False})
+        except Exception:  # noqa: BLE001 - a page closed before this ran needs nothing
+            logger.debug("passkey prompt left on for a closed page", exc_info=True)
 
     def _spawn(self, session: BrowserSession, coro: Any, name: str) -> None:
         task = asyncio.create_task(coro, name=name)
