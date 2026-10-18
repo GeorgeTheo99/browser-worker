@@ -401,8 +401,11 @@ async def test_elements_lists_page_content_first_with_refs_text_and_nearby_conte
     assert listed["elements"][5]["label"] == "Menu 0"
     refs = [row["ref"] for row in listed["elements"]]
     assert refs[:3] == ["e1", "e2", "e3"] and len(set(refs)) == len(refs)
-    assert "511 Impregnator" in listed["elements"][1]["near"]
-    assert "near" not in listed["elements"][0] or listed["elements"][0]["near"] != listed["elements"][0]["label"]
+    assert listed["elements"][1]["near"].startswith("511 Impregnator Sealer, one quart bottle Delete")
+    assert "near" not in listed["elements"][0]  # a label of its own needs no context
+    # Listing again keeps an element's ref, so an uncertain click can't be replayed under a new name.
+    again = await call(sid, "elements")
+    assert [row["ref"] for row in again["elements"]] == refs
 
     scoped = await call(sid, "elements", selector="main .row:nth-of-type(1)")
     assert [row["label"] for row in scoped["elements"]] == ["511 Impregnator Sealer, one quart bottle", "Delete"]
@@ -431,6 +434,20 @@ async def test_elements_lists_page_content_first_with_refs_text_and_nearby_conte
         assert (await call(sid, "extract_text", ref=qty))["code"] == "invalid_request"
     finally:
         auth._current_caller.reset(token)
+
+
+@pytest.mark.browser
+async def test_nearby_text_never_reads_fields_or_editable_content(browser):
+    _, sid, page, _, _ = browser
+    await page.evaluate("""() => {
+      document.body.innerHTML = [1, 2].map(i => `<div><p>Item ${i}</p><div contenteditable=true>PRIVATE_DRAFT_${i}</div>` +
+        `<textarea>PRIVATE_AREA</textarea><button>Delete</button></div>`).join('');
+      document.querySelectorAll('textarea').forEach(t => t.value = 'PRIVATE_TYPED');
+    }""")
+    listed = await call(sid, "elements", text="delete")
+    assert [row["near"] for row in listed["elements"] if row["label"] == "Delete"] == ["Item 1 Delete", "Item 2 Delete"]
+    assert "PRIVATE" not in json.dumps(listed)
+    assert all(row["label"] != "Delete" for row in (await call(sid, "elements", text="private"))["elements"])
 
 
 @pytest.mark.browser

@@ -156,16 +156,19 @@ async def test_frame_and_ancestor_changes_revoke_refs_and_approvals(framed, targ
         assert not await nested.evaluate('Boolean(window.forbidden)')
 
 
-async def test_frame_refs_not_transferable_to_tabs_sessions_or_rediscovery(framed):
-    manager, sid, _, _, _, url, _ = framed
+async def test_frame_refs_not_transferable_to_tabs_sessions_or_changed_documents(framed):
+    manager, sid, _, _, nested, url, _ = framed
     fid = (await frame_rows(sid))[-1]['frame_id']
     other = await manager.open('research', url, wait_until='domcontentloaded', timeout_ms=15000)
     assert (await call(other['session_id'], 'elements', frame_id=fid))['code'] == 'approval_stale'
     await call(sid, 'open_tab', url=url)
     assert (await call(sid, 'elements', frame_id=fid))['code'] == 'approval_stale'
     await call(sid, 'switch_tab', tab_index=0)
-    await frame_rows(sid)
+    # Back in its tab with its documents unchanged, rediscovery keeps it; a new document replaces it.
+    assert (await frame_rows(sid))[-1]['frame_id'] == fid
+    await nested.evaluate("document.open(); document.write('<p>Replaced</p>'); document.close()")
     assert (await call(sid, 'elements', frame_id=fid))['code'] == 'approval_stale'
+    assert (await frame_rows(sid))[-1]['frame_id'] != fid
 
 
 @pytest.mark.parametrize('target', ['selected', 'parent', 'top'])
@@ -384,3 +387,50 @@ async def test_frame_ancestry_is_checked_between_native_input_and_enter(framed):
     assert await local.locator('#entry').input_value() == 'Partial'
     assert await local.evaluate('window.keys') == []
     assert await nested.evaluate('window.clicks') == 0
+
+
+async def test_frame_ids_stay_while_their_documents_do_and_frame_refs_click_after_relisting(framed):
+    _, sid, _, child, _, url, _ = framed
+    first = await frame_rows(sid)
+    again = await frame_rows(sid)
+    # A client listing frames again (to check origins) keeps the id it is about to use.
+    assert [row['frame_id'] for row in again] == [row['frame_id'] for row in first]
+    fid = first[1]['frame_id']
+    listed = await call(sid, 'elements', frame_id=fid, text='go')
+    ref = next(row['ref'] for row in listed['elements'] if row['label'] == 'Go')
+    assert (await frame_rows(sid))[1]['frame_id'] == fid
+    token = auth._current_caller.set(Caller('research', frozenset({'inspect.read', 'inspect.interact'})))
+    try:
+        assert (await call(sid, 'click', ref=ref))['status'] == 'ok'
+    finally:
+        auth._current_caller.reset(token)
+    assert await child.evaluate('window.clicks') == 1
+    # A frame that loads another document gets a new id; the old one is stale.
+    await child.goto(url + 'frame-two')
+    renewed = await frame_rows(sid)
+    assert renewed[0]['frame_id'] == first[0]['frame_id']
+    assert renewed[1]['frame_id'] != fid
+    assert (await call(sid, 'elements', frame_id=fid))['code'] == 'approval_stale'
+
+
+async def test_click_at_never_lands_in_a_frame_hidden_in_a_shadow_root(approved):
+    _, sid, page, _, _ = approved
+    await page.evaluate('''() => new Promise(resolve => {
+      document.body.innerHTML = '';
+      const host = document.createElement('div');
+      host.style = 'position:fixed;left:0;top:0;width:700px;height:400px';
+      document.body.append(host);
+      const frame = document.createElement('iframe');
+      frame.style = 'width:700px;height:400px;border:0';
+      frame.srcdoc = '<button style="width:600px;height:300px" onclick="parent.hits = (parent.hits || 0) + 1">In frame</button>';
+      frame.onload = () => resolve();
+      host.attachShadow({mode: 'closed'}).append(frame);
+    })''')
+    token = auth._current_caller.set(Caller('research', frozenset({'inspect.read', 'inspect.interact'})))
+    try:
+        assert (await call(sid, 'click_at', x=50, y=30))['code'] == 'point_in_frame'
+    finally:
+        auth._current_caller.reset(token)
+    assert await page.evaluate('window.hits || 0') == 0
+    await page.main_frame.child_frames[0].locator('button').click()
+    assert await page.evaluate('window.hits') == 1  # the point would have clicked it

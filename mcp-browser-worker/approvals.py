@@ -186,6 +186,17 @@ _ELEMENTS = r"""args => {
     twins.get(key).push(el);
     found.push({el, own, key, selector});
   }
+  // Like text(), never inside a field or editable content, but with its pieces apart ("Sealer" "Delete").
+  const words = el => {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+      acceptNode: n => n.nodeType === 1 && n.matches('input,textarea,select,script,style,[contenteditable]:not([contenteditable="false"])') ?
+        NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
+    });
+    const parts = []; let n, count = 0, length = 0;
+    while ((n = walker.nextNode()) && count++ < 400 && length < 160)
+      if (n.nodeType === 3 && n.textContent.trim()) { parts.push(n.textContent.trim()); length += n.textContent.length; }
+    return parts.join(' ').replace(/\s+/g, ' ').slice(0, 160);
+  };
   // Several "Delete" buttons: each one's nearby text (its cart row) says which item it acts on. That is the
   // largest block around it holding no other element of the same label.
   const near = (el, same) => {
@@ -194,7 +205,7 @@ _ELEMENTS = r"""args => {
       if (same.some(other => other !== el && n.contains(other))) break;
       best = n;
     }
-    return best ? (best.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 160) : '';
+    return best ? words(best) : '';
   };
   const main = [], aside = [];
   for (const row of found) {

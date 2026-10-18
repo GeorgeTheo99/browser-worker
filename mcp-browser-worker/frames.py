@@ -11,8 +11,8 @@ from typing import Any
 from patchright.async_api import Error, Frame, JSHandle, Page
 
 from controls import check_access
-from errors import fail
-from security import parse_public_url
+from errors import WorkerError, fail
+from security import NetworkPolicyError, parse_public_url
 
 MAX_FRAMES = 100
 MAX_FRAME_DEPTH = 32
@@ -134,7 +134,17 @@ class FrameStore:
         self.generations.clear()
 
     async def discover(self, page: Page, limit: int) -> dict[str, Any]:
-        await self.clear()
+        # A frame whose whole document chain is unchanged keeps its id (resolve would accept it anyway), so a
+        # client can check a frame's origins by listing frames again without losing the id it's about to use.
+        kept: dict[Frame, FrameRef] = {}
+        for ref in self.refs.values():
+            if ref.page is page and await self._current(page, ref):
+                kept[ref.documents[-1].frame] = ref
+        old, self.refs = self.refs, {}
+        for ref in old.values():
+            if kept.get(ref.documents[-1].frame) is not ref:
+                for document in ref.documents:
+                    await document.dispose()
         await check_frame_access(page, page.main_frame)
         rows = []
         ids: dict[Frame, str] = {}
@@ -148,6 +158,13 @@ class FrameStore:
                 if frame.parent_frame is not None and frame.parent_frame not in ids:
                     continue
                 await check_frame_access(page, frame)
+                same = kept.pop(frame, None)
+                if same is not None:
+                    self.refs[same.id] = same
+                    ids[frame] = same.id
+                    rows.append({'frame_id': same.id, 'parent_frame_id': ids.get(frame.parent_frame),
+                                 'url': same.documents[-1].url, 'origin': same.documents[-1].origin})
+                    continue
                 documents = []
                 try:
                     generations = [self.generations.setdefault(f, 0) for f in chain]
@@ -164,10 +181,24 @@ class FrameStore:
                 ids[frame] = fid
                 rows.append({'frame_id': fid, 'parent_frame_id': ids.get(frame.parent_frame),
                              'url': documents[-1].url, 'origin': documents[-1].origin})
+            for ref in kept.values():  # unchanged, but no longer listed (over the limit)
+                for document in ref.documents:
+                    await document.dispose()
             return {'frames': rows, 'truncated': len(rows) < len(page.frames)}
         except BaseException:
+            for ref in kept.values():
+                for document in ref.documents:
+                    await document.dispose()
             await self.clear()
             raise
+
+    async def _current(self, page: Page, ref: FrameRef) -> bool:
+        """Whether resolve would still accept this reference."""
+        try:
+            await self.resolve(page, ref.id)
+        except (WorkerError, NetworkPolicyError, Error):
+            return False
+        return True
 
     async def resolve(self, page: Page, frame_id: str) -> Frame:
         ref = self.refs.get(frame_id)

@@ -379,17 +379,33 @@ class BrowserManager:
             raise fail("selector_not_found")
         return element
 
-    async def _replace_refs(self, session: BrowserSession, rows: list[dict[str, Any]], handles: list[ElementHandle]) -> None:
-        """Bind each listed row to a new short reference; references from earlier listings stop working.
+    async def _replace_refs(
+        self, session: BrowserSession, frame: Frame, rows: list[dict[str, Any]], handles: list[ElementHandle],
+    ) -> None:
+        """Bind each listed row to a short reference; references the new listing doesn't give stop working.
 
-        References never repeat within a session, so an old one can't silently mean a different element."""
-        old = list(session.refs.values())
+        An element the previous listing of this frame also gave keeps its reference, so listing again can't
+        turn one click into two differently named ones. Other references are new: none ever repeats within a
+        session, so an old one can't silently mean a different element."""
+        old = session.refs
+        same: list[str | None] = [None] * len(handles)
+        try:
+            earlier = [(ref, handle) for ref, handle in old.items() if await handle.owner_frame() == frame]
+            if earlier and handles:
+                found = await frame.evaluate(
+                    "([earlier, now]) => now.map(el => earlier.indexOf(el))", [[h for _, h in earlier], handles]
+                )
+                same = [earlier[index][0] if index >= 0 else None for index in found]
+        except BrowserError:  # an earlier listing's document is gone: nothing to keep
+            same = [None] * len(handles)
         session.refs = {}
-        for row, handle in zip(rows, handles, strict=True):
-            session.ref_seq += 1
-            row["ref"] = f"e{session.ref_seq}"
-            session.refs[row["ref"]] = handle
-        for handle in old:
+        for row, handle, ref in zip(rows, handles, same, strict=True):
+            if ref is None:
+                session.ref_seq += 1
+                ref = f"e{session.ref_seq}"
+            row["ref"] = ref
+            session.refs[ref] = handle
+        for handle in old.values():
             try:
                 await handle.dispose()
             except Exception:  # its page may be gone
@@ -425,10 +441,26 @@ class BrowserManager:
         return owner_frame, element, False
 
     async def _click_at(self, session: BrowserSession, page: Page, x: float, y: float) -> dict[str, object]:
-        """Click a point of the visible page (CSS pixels, as in a screenshot of it), and say what it hit."""
+        """Click a point of the visible page (CSS pixels, as in a screenshot of it), and say what it hit.
+
+        Never into an embedded frame, wherever it sits (a shadow root hides it from elementFromPoint): a
+        frame's own origin checks apply only through frames and frame_id."""
         await check_frame_access(page, page.main_frame)
+        for child in page.main_frame.child_frames:
+            try:
+                box = await (await child.frame_element()).bounding_box()
+            except BrowserError:  # gone meanwhile
+                continue
+            if box and box["x"] <= x < box["x"] + box["width"] and box["y"] <= y < box["y"] + box["height"]:
+                raise fail("point_in_frame")
         hit = await page.evaluate_handle(
-            "([x, y]) => (x < innerWidth && y < innerHeight) ? document.elementFromPoint(x, y) : null", [x, y]
+            """([x, y]) => {
+              if (x >= innerWidth || y >= innerHeight) return null;
+              let el = document.elementFromPoint(x, y);
+              // Into open shadow roots, to the element the click lands on.
+              for (let inner; el?.shadowRoot && (inner = el.shadowRoot.elementFromPoint(x, y)) && inner !== el;) el = inner;
+              return el;
+            }""", [x, y]
         )
         element = hit.as_element()
         if element is None:
@@ -1073,7 +1105,7 @@ class BrowserManager:
                     result, handles = await discover_elements(
                         frame, int(params.get("limit") or 50), text=params.get("text"), within=params.get("selector")
                     )
-                    await self._replace_refs(session, result["elements"], handles)
+                    await self._replace_refs(session, frame, result["elements"], handles)
                     return {"status": "ok", "session_id": session.id, **result}
                 if action in {"prepare_action", "execute_prepared", "discard_prepared"} and (
                     self._sessions.get(session_id) is not session or session.disposed
