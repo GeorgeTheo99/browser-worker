@@ -490,3 +490,59 @@ async def test_click_at_clicks_a_visible_point_and_says_what_it_hit(browser):
         assert "viewport" not in await call(sid, "screenshot")
     finally:
         auth._current_caller.reset(token)
+
+
+@pytest.mark.browser
+async def test_elements_at_a_point_of_a_tracked_screenshot_gives_the_control_it_showed_there(browser):
+    _, sid, page, _, _ = browser
+    await page.evaluate('''() => {
+      document.body.style.margin = 0;
+      document.body.innerHTML = '<div id=list style="position:absolute;left:0;top:0;width:400px;height:100px;overflow:auto">' +
+        ['A', 'B'].map(n => `<div style="height:100px"><button id=${n} style="width:200px;height:40px"><span>Add to Cart</span></button></div>`).join('') +
+        '</div><div id=host style="position:absolute;left:0;top:200px"></div>' +
+        '<button id=under style="position:absolute;left:500px;top:0;width:100px;height:40px">Delete</button>' +
+        '<button id=cover aria-label="Add to Cart" style="position:absolute;left:500px;top:0;width:100px;height:40px">Remove all</button>';
+      document.querySelector('#host').attachShadow({mode: 'open'}).innerHTML = '<button style="width:200px;height:40px">Shadow buy</button>';
+      window.added = [];
+      for (const b of document.querySelectorAll('#list button')) b.onclick = () => window.added.push(b.id);
+    }''')
+    token = auth._current_caller.set(Caller("research", frozenset({"inspect.read", "inspect.interact", "inspect.artifact"})))
+    try:
+        async def track():
+            return (await call(sid, "screenshot", full_page=False, track=True))["capture_id"]
+
+        capture = await track()
+        [row] = (await call(sid, "elements", x=50, y=20, capture_id=capture))["elements"]
+        assert (row["tag"], row["shown"], row["aria"]) == ("button", "Add to Cart", "")  # the button, not its span
+        assert (await call(sid, "click", ref=row["ref"]))["status"] == "ok"
+        assert await page.evaluate("window.added") == ["A"]
+        # What it shows and what it tells screen readers come apart.
+        [cover] = (await call(sid, "elements", x=550, y=20, capture_id=capture))["elements"]
+        assert (cover["shown"], cover["aria"]) == ("Remove all", "Add to Cart")
+        # Inside an open shadow root: the shadow button itself.
+        [shadow] = (await call(sid, "elements", x=50, y=220, capture_id=capture))["elements"]
+        assert shadow["shown"] == "Shadow buy"
+
+        # Since the screenshot: the list scrolled (B's identical button is there now), the shadow button was
+        # replaced: neither is what it showed.
+        await page.evaluate("document.querySelector('#list').scrollTop = 100")
+        assert (await call(sid, "elements", x=50, y=20, capture_id=capture))["code"] == "stale_capture"
+        capture = await track()
+        await page.evaluate("const r = document.querySelector('#host').shadowRoot; r.innerHTML = r.innerHTML")
+        assert (await call(sid, "elements", x=50, y=220, capture_id=capture))["code"] == "stale_capture"
+        # A reused node or an uncovered one is what is there now, and says so: the caller checks its words.
+        capture = await track()
+        await page.evaluate("document.querySelector('#cover').remove(); document.querySelector('#B span').textContent = 'Delete'")
+        [under] = (await call(sid, "elements", x=550, y=20, capture_id=capture))["elements"]
+        assert under["shown"] == "Delete"
+        [reused] = (await call(sid, "elements", x=50, y=20, capture_id=capture))["elements"]
+        assert reused["shown"] == "Delete"
+        assert (await call(sid, "elements", x=50, y=20, capture_id="x" * 16))["code"] == "stale_capture"
+        assert (await call(sid, "elements", x=50, y=20))["code"] == "invalid_request"
+        assert (await call(sid, "elements", x=50, y=20, capture_id=capture, text="add"))["code"] == "invalid_request"
+        assert (await call(sid, "screenshot", track=True)).get("capture_id") is None  # a full page isn't tracked
+        # A page that keeps moving while it is captured gives no capture to point in.
+        await page.evaluate("setInterval(() => document.querySelector('#under').style.left = (500 + Math.random() * 50) + 'px', 0)")
+        assert "capture_id" not in await call(sid, "screenshot", full_page=False, track=True)
+    finally:
+        auth._current_caller.reset(token)

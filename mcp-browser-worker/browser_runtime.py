@@ -24,6 +24,7 @@ from patchright.async_api import (
     Download,
     ElementHandle,
     Frame,
+    JSHandle,
     Page,
     Playwright,
     async_playwright,
@@ -139,6 +140,57 @@ def regular_user_agent(executable: Path) -> str | None:
 
 # Element references a session remembers (oldest go first), so a re-listed element keeps its own.
 MAX_ELEMENT_REFS = 1000
+# Tracked screenshot layouts a session keeps, and the elements one remembers.
+MAX_TRACKED_CAPTURES = 4
+MAX_LAYOUT_ELEMENTS = 10_000
+# Every element touching the visible page, open shadow roots included, with where it was.
+_LAYOUT_SCRIPT = """limit => {
+  const els = [], rects = [];
+  const walk = root => {
+    for (const el of root.querySelectorAll('*')) {
+      if (els.length >= limit) return;
+      const r = el.getBoundingClientRect();
+      if (r.width && r.height && r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight) {
+        els.push(el); rects.push([r.x, r.y, r.width, r.height]);
+      }
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  };
+  walk(document);
+  return {els, rects, scroll: [scrollX, scrollY], size: [innerWidth, innerHeight], full: els.length < limit};
+}"""
+# Two layouts are the same: the same elements, each where it was.
+_SAME_LAYOUT_SCRIPT = """([a, b]) => a.full && b.full && a.els.length === b.els.length &&
+  a.scroll.every((v, i) => v === b.scroll[i]) && a.size.every((v, i) => v === b.size[i]) &&
+  a.els.every((el, i) => el === b.els[i] && a.rects[i].every((v, j) => v === b.rects[i][j]))"""
+# The element at a point now, through open shadow roots, if the layout had it there (to within a pixel,
+# window unscrolled and unresized); then the control it belongs to. Null otherwise.
+_AT_POINT_SCRIPT = """(layout, [x, y, query]) => {
+  if (scrollX !== layout.scroll[0] || scrollY !== layout.scroll[1] ||
+      innerWidth !== layout.size[0] || innerHeight !== layout.size[1]) return null;
+  let el = document.elementFromPoint(x, y);
+  for (let inner; el?.shadowRoot && (inner = el.shadowRoot.elementFromPoint(x, y)) && inner !== el;) el = inner;
+  const index = el ? layout.els.indexOf(el) : -1;
+  if (index < 0) return null;
+  const r = el.getBoundingClientRect(), [rx, ry, rw, rh] = layout.rects[index];
+  if (Math.abs(r.x - rx) > 1 || Math.abs(r.y - ry) > 1 || Math.abs(r.width - rw) > 1 || Math.abs(r.height - rh) > 1)
+    return null;
+  for (let n = el; n; n = n.parentElement || (n.getRootNode() instanceof ShadowRoot ? n.getRootNode().host : null))
+    if (n.matches(query)) return n;
+  return el;
+}"""
+# What an element is: its own label, what it shows on screen and tells screen readers apart (a page can make
+# them differ), never a field's value.
+_AT_POINT_ROW = """el => {""" + _DOM_HELPERS + """
+  const aria = (el.getAttribute('aria-label') || (el.getAttribute('aria-labelledby') || '').split(/\\s+/).slice(0, 6)
+    .map(id => text(document.getElementById(id))).join(' ')).trim().slice(0, 200);
+  const own = el.matches('input[type=submit],input[type=button],input[type=reset]') ? el.value : '';
+  const shown = (text(el) || own || el.getAttribute('title') || el.getAttribute('alt') || '').trim().slice(0, 200);
+  return {tag: el.tagName.toLowerCase(), role: (el.getAttribute('role') || '').slice(0, 100),
+    label: label(el).slice(0, 500), shown, aria, type: (el.getAttribute('type') || '').slice(0, 100),
+    href: (el.matches('a[href]') ? el.href : '').slice(0, 8192)};
+}"""
+_CONTROL_QUERY = 'a[href],button,input:not([type="hidden"]),textarea,select,summary,label,[role],[tabindex],[onclick],[contenteditable="true"]'
 
 
 @dataclass(slots=True)
@@ -172,6 +224,9 @@ class BrowserSession:
     refs: dict[str, ElementHandle] = field(default_factory=dict)
     listed: set[str] = field(default_factory=set)
     ref_seq: int = 0
+    # Layouts of tracked screenshots (newest last): which element was where, so `elements` at a point of
+    # one can check that the element there now is the one the screenshot showed.
+    captures: dict[str, tuple[Page, JSHandle]] = field(default_factory=dict)
 
     @property
     def persistent(self) -> bool:
@@ -475,12 +530,10 @@ class BrowserManager:
             raise
         return owner_frame, element, False
 
-    async def _click_at(self, session: BrowserSession, page: Page, x: float, y: float) -> dict[str, object]:
-        """Click a point of the visible page (CSS pixels, as in a screenshot of it), and say what it hit.
-
-        Never into an embedded frame, wherever it sits (a shadow root hides it from elementFromPoint): a
-        frame's own origin checks apply only through frames and frame_id."""
-        await check_frame_access(page, page.main_frame)
+    @staticmethod
+    async def _no_child_frame_at(page: Page, x: float, y: float) -> None:
+        """A point never lands in an embedded frame, wherever it sits (a shadow root hides it from
+        elementFromPoint): a frame's own origin checks apply only through frames and frame_id."""
         for child in page.main_frame.child_frames:
             try:
                 box = await (await child.frame_element()).bounding_box()
@@ -488,6 +541,75 @@ class BrowserManager:
                 continue
             if box and box["x"] <= x < box["x"] + box["width"] and box["y"] <= y < box["y"] + box["height"]:
                 raise fail("point_in_frame")
+
+    async def _track_layout(self, session: BrowserSession, page: Page, capture: Any) -> tuple[Any, str | None]:
+        """Run `capture` (a screenshot) and remember which element was where while it ran: the layout must be
+        the same just before and just after, else no capture_id (the page was changing)."""
+        data = before = after = None
+        steady = False
+        try:
+            before = await page.main_frame.evaluate_handle(_LAYOUT_SCRIPT, MAX_LAYOUT_ELEMENTS)
+            data = await capture()
+            after = await page.main_frame.evaluate_handle(_LAYOUT_SCRIPT, MAX_LAYOUT_ELEMENTS)
+            steady = bool(await page.main_frame.evaluate(_SAME_LAYOUT_SCRIPT, [before, after]))
+        except BrowserError:
+            pass  # no capture_id; a failed capture leaves no data
+        finally:
+            if before is not None:
+                await self._release(before)
+        if not steady:
+            if after is not None:
+                await self._release(after)
+            return data, None
+        capture_id = secrets.token_urlsafe(12)
+        session.captures[capture_id] = (page, after)
+        while len(session.captures) > MAX_TRACKED_CAPTURES:
+            _, old = session.captures.pop(next(iter(session.captures)))
+            await self._release(old)
+        return data, capture_id
+
+    @staticmethod
+    async def _release(handle: JSHandle) -> None:
+        try:
+            await handle.dispose()
+        except Exception:  # its page may be gone
+            logger.debug("handle already released", exc_info=True)
+
+    async def _element_at(
+        self, session: BrowserSession, page: Page, x: float, y: float, capture_id: str,
+    ) -> dict[str, object]:
+        """The control at a point of a tracked screenshot, listed with a ref, if it is still the element that
+        screenshot showed there (`stale_capture` otherwise). Acting on it then goes through its ref."""
+        await check_frame_access(page, page.main_frame)
+        await self._no_child_frame_at(page, x, y)
+        captured = session.captures.get(capture_id)
+        if captured is None or captured[0] is not page:
+            raise fail("stale_capture")
+        try:
+            found = await captured[1].evaluate_handle(_AT_POINT_SCRIPT, [x, y, _CONTROL_QUERY])
+        except BrowserError as exc:  # its document is gone
+            raise fail("stale_capture") from exc
+        element = found.as_element()
+        if element is None:
+            await found.dispose()
+            raise fail("stale_capture")
+        try:
+            row = await element.evaluate(_AT_POINT_ROW)
+        except BrowserError as exc:
+            await element.dispose()
+            raise fail("stale_capture") from exc
+        if row["href"]:
+            try:
+                parse_public_url(row["href"])
+            except NetworkPolicyError:
+                row["href"] = ""
+        await self._replace_refs(session, page.main_frame, [row], [element])
+        return {"status": "ok", "session_id": session.id, "elements": [row], "truncated": False}
+
+    async def _click_at(self, session: BrowserSession, page: Page, x: float, y: float) -> dict[str, object]:
+        """Click a point of the visible page (CSS pixels, as in a screenshot of it), and say what it hit."""
+        await check_frame_access(page, page.main_frame)
+        await self._no_child_frame_at(page, x, y)
         hit = await page.evaluate_handle(
             """([x, y]) => {
               if (x >= innerWidth || y >= innerHeight) return null;
@@ -1135,6 +1257,10 @@ class BrowserManager:
                     async with asyncio.timeout(min(timeout_ms, 3000) / 1000):
                         result = await session.frames.discover(page, int(params.get("limit") or 50))
                     return {"status": "ok", "session_id": session.id, **result}
+                if action == "elements" and params.get("x") is not None:
+                    return await self._element_at(
+                        session, page, float(params["x"]), float(params["y"]), str(params["capture_id"]),
+                    )
                 if action == "elements":
                     await check_frame_access(page, frame)
                     result, handles = await discover_elements(
@@ -1372,12 +1498,24 @@ class BrowserManager:
                             if owned:
                                 await element.dispose()
                     await self._ensure_capture_bounds(page)
+                    capture_id = None
                     try:
-                        data = await page.screenshot(full_page=full_page, type="png")
+                        if params.get("track") and not full_page:
+                            data, capture_id = await self._track_layout(
+                                session, page, lambda: page.screenshot(full_page=False, type="png"),
+                            )
+                            if data is None:
+                                raise WorkerError("screenshot failed")
+                        else:
+                            data = await page.screenshot(full_page=full_page, type="png")
+                    except WorkerError:
+                        raise
                     except Exception as exc:
                         raise WorkerError("screenshot failed") from exc
                     record = await self.artifacts.create(owner, data, suffix="png", mime_type="image/png", max_bytes=MAX_SCREENSHOT_BYTES)
                     result = {"status": "ok", "session_id": session.id, "artifact": record.public()}
+                    if capture_id is not None:
+                        result["capture_id"] = capture_id
                     if not full_page:
                         # click_at takes points in this capture: CSS pixels of the visible page.
                         result["viewport"] = await page.evaluate("() => ({width: innerWidth, height: innerHeight})")

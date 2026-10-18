@@ -22,6 +22,7 @@ ERROR_MESSAGES = {
     "stale_ref": "element reference is unknown or gone from the page; list elements again",
     "point_outside": "that point is outside the visible page",
     "point_in_frame": "that point is inside an embedded frame; use frames and frame_id",
+    "stale_capture": "that point no longer shows what the screenshot did (something moved, scrolled, or was replaced); take a new one",
 }
 
 

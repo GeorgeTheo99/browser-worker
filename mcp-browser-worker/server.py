@@ -227,6 +227,8 @@ async def browser_inspect(
     ref: Annotated[str | None, Field(pattern=r"^e[1-9][0-9]{0,8}$")] = None,
     x: Annotated[float | None, Field(ge=0, le=3840)] = None,
     y: Annotated[float | None, Field(ge=0, le=2160)] = None,
+    capture_id: Annotated[str | None, Field(pattern=r"^[A-Za-z0-9_-]{16}$")] = None,
+    track: bool = False,
     frame_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
     control_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
     option: Annotated[str | None, Field(min_length=1, max_length=200)] = None,
@@ -260,7 +262,9 @@ async def browser_inspect(
     `elements` gives each listed element a short `ref` (e.g. `e12`) that `click`, `type` and `screenshot`
     accept instead of a selector; `text` keeps elements whose label or nearby text contains it, and
     `selector` lists only inside the elements it matches. `click_at` clicks the point `x`,`y` of the
-    visible page, in the CSS pixels of a screenshot with `full_page` false.
+    visible page, in the CSS pixels of a screenshot with `full_page` false. A viewport screenshot with `track`
+    returns a `capture_id`; `elements` with `x`, `y` and that `capture_id` lists, with a ref, the control at that
+    point of the screenshot if it is still the element shown there.
     """
     caller = current_caller()
     try:
@@ -274,8 +278,11 @@ async def browser_inspect(
             raise WorkerError("frame_id is unsupported for this action")
         if ref is not None and (action not in {"click", "type", "screenshot"} or selector is not None or frame_id is not None):
             raise WorkerError("ref replaces selector and frame_id for click, type and screenshot")
-        if (x is not None or y is not None) != (action == "click_at") or (action == "click_at" and None in (x, y)):
-            raise WorkerError("x and y are required for click_at and accepted only there")
+        pointed = x is not None or y is not None
+        if (action == "click_at" and not pointed) or (pointed and (action not in {"click_at", "elements"} or None in (x, y))):
+            raise WorkerError("x and y go together, for click_at or elements at a point")
+        if (capture_id is not None) != (action == "elements" and pointed) or (track and action != "screenshot"):
+            raise WorkerError("elements at a point needs its screenshot's capture_id; track is only for screenshot")
         if frame_id is not None:
             _bounded_text(frame_id, name="frame_id", maximum=128, required=True)
         if action in {"prepare_action", "execute_prepared", "discard_prepared"}:
@@ -397,6 +404,12 @@ async def browser_inspect(
             params["tab_index"] = tab_index
         elif action == "extract_text" or action == "extract_links":
             params["selector"] = _bounded_text(selector, name="selector", maximum=2000)
+        elif action == "elements" and pointed:
+            if any(value is not None for value in (text, selector, frame_id)):
+                raise WorkerError("elements at a point takes no filter, area, or frame")
+            if not (math.isfinite(x) and math.isfinite(y)):  # type: ignore[arg-type]
+                raise WorkerError("x and y must be finite")
+            params["x"], params["y"], params["capture_id"] = x, y, capture_id
         elif action == "elements":
             params["text"] = _bounded_text(text, name="text", maximum=200)
             params["selector"] = _bounded_text(selector, name="selector", maximum=2000)
@@ -419,6 +432,8 @@ async def browser_inspect(
             caller.require("inspect.artifact")
             if action == "screenshot" and (selector is not None or ref is not None):
                 _target_params(params, selector, ref)
+            if track:
+                params["track"] = True
         elif action == "downloads":
             caller.require("inspect.download")
         elif action == "evaluate":
