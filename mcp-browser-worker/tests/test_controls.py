@@ -582,3 +582,44 @@ async def test_elements_at_a_point_reads_web_components_as_they_render(browser):
         assert unknown["aria"] == "" and unknown["aria_unknown"]
     finally:
         auth._current_caller.reset(token)
+
+
+@pytest.mark.browser
+async def test_elements_at_a_point_says_only_what_renders_and_what_its_own_scope_labels(browser):
+    _, sid, page, _, _ = browser
+    await page.evaluate('''() => {
+      document.body.style.margin = 0;
+      document.body.innerHTML = '<span id=outside>Approve purchase</span>' +
+        '<div id=scoped style="position:absolute;left:0;top:0"></div>' +
+        '<button id=hidden style="position:absolute;left:0;top:100px;width:200px;height:40px" aria-labelledby=name>' +
+        'Delete<span style="visibility:hidden"> nothing</span><span style="opacity:0"> at all</span></button>' +
+        '<span id=name hidden>Delete account</span>' +
+        '<my-card id=card style="position:absolute;left:0;top:200px"><span slot=gone>Approve</span>Pay</my-card>' +
+        '<canvas id=pad width=600 height=100 style="position:absolute;left:0;top:300px" tabindex=0></canvas>' +
+        '<p style="position:absolute;left:0;top:450px;width:300px">Plain words</p>';
+      // A shadow button naming an id only the document has: not its label.
+      document.querySelector('#scoped').attachShadow({mode: 'open'}).innerHTML =
+        '<button aria-labelledby=outside style="width:200px;height:40px">Delete account</button>';
+      // Text assigned to a slot that doesn't render.
+      document.querySelector('#card').attachShadow({mode: 'open'}).innerHTML =
+        '<button style="width:200px;height:40px"><slot name=gone style="display:none"></slot><slot></slot></button>';
+    }''')
+    token = auth._current_caller.set(Caller("research", frozenset({"inspect.read", "inspect.artifact"})))
+    try:
+        capture = (await call(sid, "screenshot", full_page=False, track=True))["capture_id"]
+
+        async def at(x, y):
+            [row] = (await call(sid, "elements", x=x, y=y, capture_id=capture))["elements"]
+            return row
+
+        scoped = await at(50, 20)
+        assert (scoped["shown"], scoped["aria"], scoped["aria_unknown"]) == ("Delete account", "", True)
+        hidden = await at(50, 120)
+        # A hidden label still names it for screen readers; invisible text isn't shown.
+        assert (hidden["shown"], hidden["aria"], hidden["control"]) == ("Delete", "Delete account", True)
+        assert (await at(50, 220))["shown"] == "Pay"
+        # A canvas, or plain content, isn't a control: its ref would click the middle of it.
+        assert (await at(30, 350))["control"] is False
+        assert (await at(30, 455))["control"] is False
+    finally:
+        auth._current_caller.reset(token)

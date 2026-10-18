@@ -179,39 +179,51 @@ _AT_POINT_SCRIPT = """([before, after, x, y, query]) => {
   if (!el || !held(el)) return null;
   const up = n => n.assignedSlot || n.parentElement || (n.getRootNode() instanceof ShadowRoot ? n.getRootNode().host : null);
   for (let n = el; n; n = up(n))
-    if (n.matches(query)) return held(n) ? n : null;
-  return el;
+    if (n.matches(query)) return held(n) ? {el: n, control: true} : null;
+  return {el, control: false};
 }"""
-# What an element is: what it shows on screen (its rendered text through shadow roots and slots, a button
-# input's value, title, or alt; never a field's value) and what it tells screen readers (`aria_unknown` when
-# its aria-labelledby names nothing that can be read), which a page can make differ.
-_AT_POINT_ROW = """el => {""" + _DOM_HELPERS + """
+# What an element is: what it shows on screen (text that renders: through shadow roots and slots, with a box,
+# not hidden or transparent; else a button input's value, title, or alt; never a field's value) and what it
+# tells screen readers (aria-label, or aria-labelledby resolved in its own tree scope, hidden text included;
+# `aria_unknown` when that names nothing readable), which a page can make differ. `control` is false for a
+# point that isn't on a control (a canvas, or plain content): its ref would click the middle of it.
+_AT_POINT_ROW = """(el, control) => {""" + _DOM_HELPERS + """
   const skip = n => n.matches('input,textarea,select,script,style,[contenteditable]:not([contenteditable="false"])');
-  const rendered = root => {
+  const children = n => n.localName === 'slot' && n.assignedNodes({flatten: true}).length
+    ? n.assignedNodes({flatten: true}) : n.shadowRoot ? n.shadowRoot.childNodes : n.childNodes;
+  const collect = (root, keep) => {
     const out = []; let count = 0, length = 0;
-    const visit = n => {
+    const visit = (n, box) => {
       if (count++ > 600 || length > 200) return;
-      if (n.nodeType === 3) { const t = n.textContent.trim(); if (t) { out.push(t); length += t.length; } return; }
-      if (n.nodeType !== 1 || skip(n)) return;
-      if (n.localName === 'slot') {
-        const assigned = n.assignedNodes({flatten: true});
-        for (const c of assigned.length ? assigned : n.childNodes) visit(c);
+      if (n.nodeType === 3) {
+        const t = n.textContent.trim();
+        if (t && keep(n, box)) { out.push(t); length += t.length; }
         return;
       }
-      if (!n.checkVisibility() && getComputedStyle(n).display !== 'contents') return;
-      for (const c of (n.shadowRoot ? n.shadowRoot.childNodes : n.childNodes)) visit(c);
+      if (n.nodeType !== 1 || skip(n)) return;
+      const contents = getComputedStyle(n).display === 'contents';
+      for (const c of children(n)) visit(c, contents ? box : n);
     };
     if (root.isContentEditable || skip(root)) return '';
-    visit(root);
+    visit(root, root);
     return out.join(' ').replace(/\\s+/g, ' ').slice(0, 200);
   };
+  const renders = (t, box) => {
+    const range = document.createRange();
+    range.selectNodeContents(t);
+    return [...range.getClientRects()].some(r => r.width && r.height) &&
+      box.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
+  };
   const ids = (el.getAttribute('aria-labelledby') || '').split(/\\s+/).filter(Boolean).slice(0, 6);
-  const named = ids.map(id => el.getRootNode().getElementById?.(id) || document.getElementById(id)).filter(Boolean);
-  const aria = (el.getAttribute('aria-label') || named.map(rendered).join(' ')).replace(/\\s+/g, ' ').trim().slice(0, 200);
+  const scope = el.getRootNode();
+  const named = ids.map(id => scope.getElementById ? scope.getElementById(id) : null).filter(Boolean);
+  const aria = (el.getAttribute('aria-label') || named.map(n => collect(n, () => true)).join(' '))
+    .replace(/\\s+/g, ' ').trim().slice(0, 200);
   const own = el.matches('input[type=submit],input[type=button],input[type=reset]') ? el.value : '';
-  const shown = (rendered(el) || own || el.getAttribute('title') || el.getAttribute('alt') || '').trim().slice(0, 200);
+  const shown = (collect(el, renders) || own || el.getAttribute('title') || el.getAttribute('alt') || '').trim().slice(0, 200);
   return {tag: el.tagName.toLowerCase(), role: (el.getAttribute('role') || '').slice(0, 100),
     label: label(el).slice(0, 500), shown, aria, aria_unknown: !el.getAttribute('aria-label') && ids.length > 0 && !aria,
+    control: control && el.localName !== 'canvas',
     type: (el.getAttribute('type') || '').slice(0, 100), href: (el.matches('a[href]') ? el.href : '').slice(0, 8192)};
 }"""
 _CONTROL_QUERY = 'a[href],button,input:not([type="hidden"]),textarea,select,summary,label,[role],[tabindex],[onclick],[contenteditable="true"]'
@@ -604,12 +616,19 @@ class BrowserManager:
             found = await page.main_frame.evaluate_handle(_AT_POINT_SCRIPT, [captured[1], captured[2], x, y, _CONTROL_QUERY])
         except BrowserError as exc:  # its document is gone
             raise fail("stale_capture") from exc
-        element = found.as_element()
-        if element is None:
+        try:
+            target = await found.get_property("el")
+            control = bool(await (await found.get_property("control")).json_value())
+        except BrowserError as exc:
+            raise fail("stale_capture") from exc
+        finally:
             await found.dispose()
+        element = target.as_element()
+        if element is None:
+            await target.dispose()
             raise fail("stale_capture")
         try:
-            row = await element.evaluate(_AT_POINT_ROW)
+            row = await element.evaluate(_AT_POINT_ROW, control)
         except BrowserError as exc:
             await element.dispose()
             raise fail("stale_capture") from exc
