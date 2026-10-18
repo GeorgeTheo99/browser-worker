@@ -23,6 +23,7 @@ from patchright.async_api import (
     ConsoleMessage,
     Download,
     ElementHandle,
+    Frame,
     Page,
     Playwright,
     async_playwright,
@@ -355,13 +356,33 @@ class BrowserManager:
         page.on("console", on_console)
         page.on("download", lambda download: self._on_download(session, download))
 
+    async def _one_target(self, frame: Frame, selector: str, timeout_ms: int) -> ElementHandle:
+        """The element a click or typing goes to: the selector's only match, or its only visible one.
+
+        Sites repeat ids in hidden copies (Amazon's buy box has an Add to Cart per purchase option).
+        """
+        locator = frame.locator(selector)
+        try:
+            await locator.first.wait_for(state="attached", timeout=timeout_ms)
+        except BrowserTimeoutError as exc:  # nothing matched in time
+            raise fail("selector_not_found") from exc
+        matches = [locator.nth(index) for index in range(await locator.count())]
+        if len(matches) > 1:
+            matches = [match for match in matches if await match.is_visible()]
+            if len(matches) != 1:
+                raise fail("selector_ambiguous")
+        element = await matches[0].element_handle(timeout=timeout_ms) if matches else None
+        if element is None:
+            raise fail("selector_not_found")
+        return element
+
     async def _no_passkey_prompt(self, page: Page) -> None:
         """Turn off Chrome's passkey prompt. A headless page can't show it, yet it takes the keyboard:
         Amazon's password page asks for a passkey on load, and then no key (nor Enter) reaches the page."""
         try:
             cdp = await page.context.new_cdp_session(page)
             await cdp.send("WebAuthn.enable", {"enableUI": False})
-        except Exception:  # noqa: BLE001 - a page closed before this ran needs nothing
+        except Exception:  # a page closed before this ran needs nothing
             logger.debug("passkey prompt left on for a closed page", exc_info=True)
 
     def _spawn(self, session: BrowserSession, coro: Any, name: str) -> None:
@@ -1129,9 +1150,7 @@ class BrowserManager:
                 if action == "click":
                     try:
                         await check_frame_access(page, frame)
-                        element = await frame.locator(str(params["selector"])).element_handle(timeout=timeout_ms)
-                        if element is None:
-                            raise fail("selector_not_found")
+                        element = await self._one_target(frame, str(params["selector"]), timeout_ms)
                         try:
                             if await element.owner_frame() != frame:
                                 raise fail("invalid_request")
@@ -1139,6 +1158,8 @@ class BrowserManager:
                             await element.click(timeout=timeout_ms)
                         finally:
                             await element.dispose()
+                    except WorkerError:
+                        raise
                     except Exception as exc:
                         raise WorkerError("click failed") from exc
                     return await self._state(session)
@@ -1147,9 +1168,7 @@ class BrowserManager:
                     editable = True
                     try:
                         await check_frame_access(page, frame)
-                        element = await frame.locator(str(params["selector"])).element_handle(timeout=timeout_ms)
-                        if element is None:
-                            raise fail("selector_not_found")
+                        element = await self._one_target(frame, str(params["selector"]), timeout_ms)
                         if await element.owner_frame() != frame:
                             raise fail("invalid_request")
                         await self._no_upload(element)
@@ -1162,6 +1181,8 @@ class BrowserManager:
                         if params.get("submit", False):
                             await check_frame_access(page, frame)
                             await element.press("Enter", timeout=timeout_ms)
+                    except WorkerError:
+                        raise
                     except Exception as exc:
                         raise WorkerError("typing failed") from exc
                     finally:

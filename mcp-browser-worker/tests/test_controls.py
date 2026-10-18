@@ -355,3 +355,25 @@ async def test_safe_exception_boundary_and_extraction_timeout(monkeypatch):
         result = await mcp_server._safe_call(manager.act("owner", "session", action))
         assert result.structured_content["code"] == "extraction_timeout"
         assert "SECRET" not in json.dumps(result.structured_content)
+
+
+@pytest.mark.browser
+async def test_click_and_type_use_the_only_visible_match_and_say_why_otherwise(browser):
+    _, sid, page, _, _ = browser
+    await page.evaluate('''() => {
+      document.body.insertAdjacentHTML('beforeend',
+        '<div hidden><button id=add>Add</button><input id=qty></div><button id=add>Add</button><input id=qty>' +
+        '<button class=twin>A</button><button class=twin>B</button>');
+      window.added = 0;
+      for (const b of document.querySelectorAll('#add')) b.onclick = () => window.added++;
+    }''')
+    token = auth._current_caller.set(Caller("research", frozenset({"inspect.read", "inspect.interact"})))
+    try:
+        assert (await call(sid, "click", selector="#add"))["status"] == "ok"
+        assert await page.evaluate("window.added") == 1
+        assert (await call(sid, "type", selector="#qty", text="2"))["status"] == "ok"
+        assert await page.locator("#qty").nth(1).input_value() == "2"
+        assert (await call(sid, "click", selector=".twin"))["code"] == "selector_ambiguous"
+        assert (await call(sid, "click", selector="#nothing", timeout_ms=1000))["code"] == "selector_not_found"
+    finally:
+        auth._current_caller.reset(token)
