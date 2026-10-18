@@ -643,5 +643,10 @@ async def test_elements_at_a_point_box_covers_everything_the_control_paints(brow
         assert row["tag"] == "button"
         left, top, width, height = row["box"]  # the button and its label positioned outside it
         assert (left, top) == (0, 0) and width >= 380 and height >= 220
+        # Too much in it to measure: all of the visible page.
+        await page.evaluate("document.querySelector('#pay').insertAdjacentHTML('afterbegin', '<i hidden></i>'.repeat(2001))")
+        capture = (await call(sid, "screenshot", full_page=False, track=True))["capture_id"]
+        [row] = (await call(sid, "elements", x=310, y=210, capture_id=capture))["elements"]
+        assert row["box"] == [0, 0, 1440, 900]
     finally:
         auth._current_caller.reset(token)

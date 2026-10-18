@@ -224,7 +224,8 @@ _AT_POINT_ROW = """(el, control) => {""" + _DOM_HELPERS + """
   const painted = root => {
     let [l, t, r, b] = [Infinity, Infinity, -Infinity, -Infinity], count = 0;
     const visit = n => {
-      if (n.nodeType !== 1 || count++ > 2000) return;
+      if (n.nodeType !== 1 || count > 2000) return;
+      count++;
       for (const box of n.getClientRects())
         if (box.width && box.height) {
           l = Math.min(l, box.left); t = Math.min(t, box.top); r = Math.max(r, box.right); b = Math.max(b, box.bottom);
@@ -232,6 +233,7 @@ _AT_POINT_ROW = """(el, control) => {""" + _DOM_HELPERS + """
       for (const c of children(n)) visit(c);
     };
     visit(root);
+    if (count > 2000) return [0, 0, innerWidth, innerHeight];  // too much to measure: all of the visible page
     [l, t, r, b] = [Math.max(l, 0), Math.max(t, 0), Math.min(r, innerWidth), Math.min(b, innerHeight)];
     return r > l && b > t ? [l, t, r - l, b - t] : null;
   };
