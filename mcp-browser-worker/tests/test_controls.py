@@ -514,6 +514,7 @@ async def test_elements_at_a_point_of_a_tracked_screenshot_gives_the_control_it_
         capture = await track()
         [row] = (await call(sid, "elements", x=50, y=20, capture_id=capture))["elements"]
         assert (row["tag"], row["shown"], row["aria"]) == ("button", "Add to Cart", "")  # the button, not its span
+        assert row["box"] == [0, 0, 200, 40]  # where it is on the visible page, in CSS pixels
         assert (await call(sid, "click", ref=row["ref"]))["status"] == "ok"
         assert await page.evaluate("window.added") == ["A"]
         # What it shows and what it tells screen readers come apart.

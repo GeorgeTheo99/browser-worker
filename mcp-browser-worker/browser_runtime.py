@@ -229,6 +229,7 @@ _AT_POINT_ROW = """(el, control) => {""" + _DOM_HELPERS + """
   return {tag: el.tagName.toLowerCase(), role: (el.getAttribute('role') || '').slice(0, 100),
     label: label(el).slice(0, 500), shown, aria, aria_unknown: !el.getAttribute('aria-label') && ids.length > 0 && !aria,
     control: control && el.localName !== 'canvas',
+    box: (r => [r.x, r.y, r.width, r.height])(el.getBoundingClientRect()),
     type: (el.getAttribute('type') || '').slice(0, 100), href: (el.matches('a[href]') ? el.href : '').slice(0, 8192)};
 }"""
 _CONTROL_QUERY = 'a[href],button,input:not([type="hidden"]),textarea,select,summary,label,[role],[tabindex],[onclick],[contenteditable="true"]'
