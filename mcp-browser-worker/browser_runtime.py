@@ -137,6 +137,10 @@ def regular_user_agent(executable: Path) -> str | None:
     )
 
 
+# Element references a session remembers (oldest go first), so a re-listed element keeps its own.
+MAX_ELEMENT_REFS = 1000
+
+
 @dataclass(slots=True)
 class BrowserSession:
     id: str
@@ -163,8 +167,10 @@ class BrowserSession:
     downloads: list[dict[str, object]] = field(default_factory=list)
     tasks: set[asyncio.Task[None]] = field(default_factory=set)
     live: LiveView = field(default_factory=LiveView)
-    # Short element references from the latest `elements` listing, each bound to its exact element.
+    # Every short element reference `elements` gave, oldest first, each bound to its exact element; only
+    # those the latest listing gave can be acted on.
     refs: dict[str, ElementHandle] = field(default_factory=dict)
+    listed: set[str] = field(default_factory=set)
     ref_seq: int = 0
 
     @property
@@ -382,30 +388,59 @@ class BrowserManager:
     async def _replace_refs(
         self, session: BrowserSession, frame: Frame, rows: list[dict[str, Any]], handles: list[ElementHandle],
     ) -> None:
-        """Bind each listed row to a short reference; references the new listing doesn't give stop working.
+        """Give each listed row a short reference; only this listing's references can be acted on now.
 
-        An element the previous listing of this frame also gave keeps its reference, so listing again can't
-        turn one click into two differently named ones. Other references are new: none ever repeats within a
+        An element listed before keeps its reference, so listing again (whatever the filter) can't turn one
+        click into two differently named ones. A new element gets a new one: none ever repeats within a
         session, so an old one can't silently mean a different element."""
-        old = session.refs
+        earlier = []
+        for ref, handle in session.refs.items():
+            try:
+                if await handle.owner_frame() == frame:
+                    earlier.append((ref, handle))
+            except BrowserError:
+                pass
         same: list[str | None] = [None] * len(handles)
-        try:
-            earlier = [(ref, handle) for ref, handle in old.items() if await handle.owner_frame() == frame]
-            if earlier and handles:
+        for attempt in range(2):
+            if not earlier or not handles:
+                break
+            try:
                 found = await frame.evaluate(
                     "([earlier, now]) => now.map(el => earlier.indexOf(el))", [[h for _, h in earlier], handles]
                 )
                 same = [earlier[index][0] if index >= 0 else None for index in found]
-        except BrowserError:  # an earlier listing's document is gone: nothing to keep
-            same = [None] * len(handles)
-        session.refs = {}
+                break
+            except BrowserError:
+                if attempt:
+                    break
+                # Some are from a document this frame no longer shows: forget them, compare the rest.
+                alive = []
+                for ref, handle in earlier:
+                    try:
+                        if await handle.evaluate("el => el.ownerDocument === document"):
+                            alive.append((ref, handle))
+                            continue
+                    except BrowserError:
+                        pass
+                    await self._forget_ref(session, ref)
+                earlier = alive
+        session.listed = set()
         for row, handle, ref in zip(rows, handles, same, strict=True):
             if ref is None:
                 session.ref_seq += 1
                 ref = f"e{session.ref_seq}"
+                session.refs[ref] = handle
+            else:
+                await handle.dispose()  # the one it was first listed by stays
             row["ref"] = ref
-            session.refs[ref] = handle
-        for handle in old.values():
+            session.listed.add(ref)
+        for ref in [ref for ref in session.refs if ref not in session.listed][:max(0, len(session.refs) - MAX_ELEMENT_REFS)]:
+            await self._forget_ref(session, ref)
+
+    @staticmethod
+    async def _forget_ref(session: BrowserSession, ref: str) -> None:
+        handle = session.refs.pop(ref, None)
+        if handle is not None:
             try:
                 await handle.dispose()
             except Exception:  # its page may be gone
@@ -419,7 +454,7 @@ class BrowserManager:
         if ref is None:
             await check_frame_access(page, frame)
             return frame, await self._one_target(frame, str(params["selector"]), timeout_ms), True
-        element = session.refs.get(str(ref))
+        element = session.refs.get(str(ref)) if str(ref) in session.listed else None
         if element is None:
             raise fail("stale_ref")
         try:

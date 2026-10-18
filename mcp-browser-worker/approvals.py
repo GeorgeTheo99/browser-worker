@@ -188,6 +188,8 @@ _ELEMENTS = r"""args => {
   }
   // Like text(), never inside a field or editable content, but with its pieces apart ("Sealer" "Delete").
   const words = el => {
+    // A walker never tests its root: an editable block (or one inside editable content) gives nothing.
+    if (el.isContentEditable || el.matches('input,textarea,select,[contenteditable]:not([contenteditable="false"])')) return '';
     const walker = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
       acceptNode: n => n.nodeType === 1 && n.matches('input,textarea,select,script,style,[contenteditable]:not([contenteditable="false"])') ?
         NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT

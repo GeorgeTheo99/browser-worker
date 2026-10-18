@@ -403,9 +403,12 @@ async def test_elements_lists_page_content_first_with_refs_text_and_nearby_conte
     assert refs[:3] == ["e1", "e2", "e3"] and len(set(refs)) == len(refs)
     assert listed["elements"][1]["near"].startswith("511 Impregnator Sealer, one quart bottle Delete")
     assert "near" not in listed["elements"][0]  # a label of its own needs no context
-    # Listing again keeps an element's ref, so an uncertain click can't be replayed under a new name.
+    # Listing again keeps an element's ref, so an uncertain click can't be replayed under a new name,
+    # even after a listing with another filter in between.
     again = await call(sid, "elements")
     assert [row["ref"] for row in again["elements"]] == refs
+    await call(sid, "elements", text="quantity")
+    assert [row["ref"] for row in (await call(sid, "elements", text="mb-11"))["elements"]] == [refs[2], refs[3]]
 
     scoped = await call(sid, "elements", selector="main .row:nth-of-type(1)")
     assert [row["label"] for row in scoped["elements"]] == ["511 Impregnator Sealer, one quart bottle", "Delete"]
@@ -448,6 +451,13 @@ async def test_nearby_text_never_reads_fields_or_editable_content(browser):
     assert [row["near"] for row in listed["elements"] if row["label"] == "Delete"] == ["Item 1 Delete", "Item 2 Delete"]
     assert "PRIVATE" not in json.dumps(listed)
     assert all(row["label"] != "Delete" for row in (await call(sid, "elements", text="private"))["elements"])
+    # Nor when the block around the buttons is itself editable, or inside editable content.
+    await page.evaluate("""() => {
+      document.body.innerHTML = '<div contenteditable=true><div>PRIVATE_ROOT_1 <button>Delete</button></div></div>' +
+        '<div contenteditable=true><div>PRIVATE_ROOT_2 <button>Delete</button></div></div>';
+    }""")
+    assert "PRIVATE" not in json.dumps(await call(sid, "elements"))
+    assert (await call(sid, "elements", text="private"))["elements"] == []
 
 
 @pytest.mark.browser
