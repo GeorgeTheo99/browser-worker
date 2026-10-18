@@ -596,6 +596,7 @@ async def test_elements_at_a_point_says_only_what_renders_and_what_its_own_scope
         '<span id=name hidden>Delete account</span>' +
         '<my-card id=card style="position:absolute;left:0;top:200px"><span slot=gone>Approve</span>Pay</my-card>' +
         '<canvas id=pad width=600 height=100 style="position:absolute;left:0;top:300px" tabindex=0></canvas>' +
+        '<a href="/pay" style="position:absolute;left:700px;top:300px"><canvas width=200 height=100></canvas></a>' +
         '<p style="position:absolute;left:0;top:450px;width:300px">Plain words</p>';
       // A shadow button naming an id only the document has: not its label.
       document.querySelector('#scoped').attachShadow({mode: 'open'}).innerHTML =
@@ -620,6 +621,7 @@ async def test_elements_at_a_point_says_only_what_renders_and_what_its_own_scope
         assert (await at(50, 220))["shown"] == "Pay"
         # A canvas, or plain content, isn't a control: its ref would click the middle of it.
         assert (await at(30, 350))["control"] is False
+        assert (await at(750, 350))["control"] is False  # a link around a canvas: its middle isn't the point
         assert (await at(30, 455))["control"] is False
     finally:
         auth._current_caller.reset(token)

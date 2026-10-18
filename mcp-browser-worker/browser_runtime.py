@@ -178,12 +178,17 @@ _AT_POINT_SCRIPT = """([before, after, x, y, query]) => {
   for (let inner; el?.shadowRoot && (inner = el.shadowRoot.elementFromPoint(x, y)) && inner !== el;) el = inner;
   if (!el || !held(el)) return null;
   const up = n => n.assignedSlot || n.parentElement || (n.getRootNode() instanceof ShadowRoot ? n.getRootNode().host : null);
-  for (let n = el; n; n = up(n))
-    if (n.matches(query)) return held(n) ? {el: n, control: true} : null;
+  // A canvas on the way (even inside a link) draws its own targets: the control's middle isn't the point.
+  let canvas = false;
+  for (let n = el; n; n = up(n)) {
+    canvas ||= n.localName === 'canvas';
+    if (n.matches(query)) return held(n) ? {el: n, control: !canvas} : null;
+  }
   return {el, control: false};
 }"""
-# What an element is: what it shows on screen (text that renders: through shadow roots and slots, with a box,
-# not hidden or transparent; else a button input's value, title, or alt; never a field's value) and what it
+# What an element is: what it shows on screen (best effort: text with a box through shadow roots and slots,
+# not hidden or transparent, though clipped or positioned text can slip in; else a button input's value,
+# title, or alt; never a field's value) and what it
 # tells screen readers (aria-label, or aria-labelledby resolved in its own tree scope, hidden text included;
 # `aria_unknown` when that names nothing readable), which a page can make differ. `control` is false for a
 # point that isn't on a control (a canvas, or plain content): its ref would click the middle of it.
