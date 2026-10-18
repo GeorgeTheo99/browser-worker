@@ -626,3 +626,22 @@ async def test_elements_at_a_point_says_only_what_renders_and_what_its_own_scope
         assert (await at(30, 455))["control"] is False
     finally:
         auth._current_caller.reset(token)
+
+
+@pytest.mark.browser
+async def test_elements_at_a_point_box_covers_everything_the_control_paints(browser):
+    _, sid, page, _, _ = browser
+    await page.evaluate('''() => {
+      document.body.style.margin = 0;
+      document.body.innerHTML = '<button id=pay style="position:absolute;left:0;top:0;width:100px;height:40px">' +
+        '<span style="position:absolute;left:300px;top:200px;width:80px;height:20px">Pay $1</span></button>';
+    }''')
+    token = auth._current_caller.set(Caller("research", frozenset({"inspect.read", "inspect.artifact"})))
+    try:
+        capture = (await call(sid, "screenshot", full_page=False, track=True))["capture_id"]
+        [row] = (await call(sid, "elements", x=310, y=210, capture_id=capture))["elements"]
+        assert row["tag"] == "button"
+        left, top, width, height = row["box"]  # the button and its label positioned outside it
+        assert (left, top) == (0, 0) and width >= 380 and height >= 220
+    finally:
+        auth._current_caller.reset(token)

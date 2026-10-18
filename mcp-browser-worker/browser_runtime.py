@@ -219,6 +219,22 @@ _AT_POINT_ROW = """(el, control) => {""" + _DOM_HELPERS + """
     return [...range.getClientRects()].some(r => r.width && r.height) &&
       box.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
   };
+  // Where it and everything in it (through shadow roots and slots) paint on the visible page: a label can be
+  // positioned outside the control's own box.
+  const painted = root => {
+    let [l, t, r, b] = [Infinity, Infinity, -Infinity, -Infinity], count = 0;
+    const visit = n => {
+      if (n.nodeType !== 1 || count++ > 2000) return;
+      for (const box of n.getClientRects())
+        if (box.width && box.height) {
+          l = Math.min(l, box.left); t = Math.min(t, box.top); r = Math.max(r, box.right); b = Math.max(b, box.bottom);
+        }
+      for (const c of children(n)) visit(c);
+    };
+    visit(root);
+    [l, t, r, b] = [Math.max(l, 0), Math.max(t, 0), Math.min(r, innerWidth), Math.min(b, innerHeight)];
+    return r > l && b > t ? [l, t, r - l, b - t] : null;
+  };
   const ids = (el.getAttribute('aria-labelledby') || '').split(/\\s+/).filter(Boolean).slice(0, 6);
   const scope = el.getRootNode();
   const named = ids.map(id => scope.getElementById ? scope.getElementById(id) : null).filter(Boolean);
@@ -229,7 +245,7 @@ _AT_POINT_ROW = """(el, control) => {""" + _DOM_HELPERS + """
   return {tag: el.tagName.toLowerCase(), role: (el.getAttribute('role') || '').slice(0, 100),
     label: label(el).slice(0, 500), shown, aria, aria_unknown: !el.getAttribute('aria-label') && ids.length > 0 && !aria,
     control: control && el.localName !== 'canvas',
-    box: (r => [r.x, r.y, r.width, r.height])(el.getBoundingClientRect()),
+    box: painted(el),
     type: (el.getAttribute('type') || '').slice(0, 100), href: (el.matches('a[href]') ? el.href : '').slice(0, 8192)};
 }"""
 _CONTROL_QUERY = 'a[href],button,input:not([type="hidden"]),textarea,select,summary,label,[role],[tabindex],[onclick],[contenteditable="true"]'
