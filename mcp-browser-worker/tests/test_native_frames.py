@@ -434,3 +434,23 @@ async def test_click_at_never_lands_in_a_frame_hidden_in_a_shadow_root(approved)
     assert await page.evaluate('window.hits || 0') == 0
     await page.main_frame.child_frames[0].locator('button').click()
     assert await page.evaluate('window.hits') == 1  # the point would have clicked it
+
+
+async def test_scroll_in_an_embedded_frame_moves_that_frame_and_never_wheels_into_a_frame_inside_it(framed):
+    _, sid, page, child, nested, _, _ = framed
+    await child.evaluate("document.body.style.height = '3000px'")
+    await nested.evaluate("document.body.style.height = '3000px'")
+    fid = (await frame_rows(sid))[1]['frame_id']
+    token = auth._current_caller.set(Caller('research', frozenset({'inspect.read', 'inspect.interact'})))
+    try:
+        down = await call(sid, 'scroll', frame_id=fid, selector='#go', dy=300)
+        assert {key: down['scrolled'][key] for key in ('area', 'moved', 'y')} == {'area': 'frame', 'moved': True, 'y': 300}
+        assert await child.evaluate('scrollY') == 300 and await page.evaluate('scrollY') == 0
+        # A ref from elements: brought back into view first, then the wheel turns over it.
+        ref = next(row['ref'] for row in (await call(sid, 'elements', frame_id=fid))['elements'] if row['label'] == 'Go')
+        assert (await call(sid, 'scroll', ref=ref, dy=100))['scrolled']['y'] == 100
+        # The frame inside it fills the middle of the frame's visible part.
+        assert (await call(sid, 'scroll', frame_id=fid, selector='body', dy=100))['code'] == 'point_in_frame'
+        assert await nested.evaluate('scrollY') == 0
+    finally:
+        auth._current_caller.reset(token)

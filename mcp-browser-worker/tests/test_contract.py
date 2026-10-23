@@ -23,6 +23,9 @@ def test_exact_two_tool_inventory_and_closed_schemas() -> None:
     assert properties["operation"]["anyOf"][0]["enum"] == ["click", "type", "evaluate"]
     assert properties["control_id"]["anyOf"][0]["maxLength"] == 128
     assert properties["option"]["anyOf"][0]["maxLength"] == 200
+    assert "scroll" in actions
+    assert {properties[key]["anyOf"][0]["minimum"] for key in ("dx", "dy")} == {-10_000}
+    assert {properties[key]["anyOf"][0]["maximum"] for key in ("dx", "dy")} == {10_000}
     assert "upload" not in actions
     assert "download" not in actions
     assert set(by_name) == {"browser_fetch", "browser_inspect"}

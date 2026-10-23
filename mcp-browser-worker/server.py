@@ -65,6 +65,7 @@ InspectAction = Literal[
     "export_pdf",
     "click",
     "click_at",
+    "scroll",
     "type",
     "evaluate",
 ]
@@ -227,6 +228,8 @@ async def browser_inspect(
     ref: Annotated[str | None, Field(pattern=r"^e[1-9][0-9]{0,8}$")] = None,
     x: Annotated[float | None, Field(ge=0, le=3840)] = None,
     y: Annotated[float | None, Field(ge=0, le=2160)] = None,
+    dx: Annotated[float | None, Field(ge=-10_000, le=10_000)] = None,
+    dy: Annotated[float | None, Field(ge=-10_000, le=10_000)] = None,
     capture_id: Annotated[str | None, Field(pattern=r"^[A-Za-z0-9_-]{16}$")] = None,
     track: bool = False,
     frame_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
@@ -262,7 +265,10 @@ async def browser_inspect(
     `elements` gives each listed element a short `ref` (e.g. `e12`) that `click`, `type` and `screenshot`
     accept instead of a selector; `text` keeps elements whose label or nearby text contains it, and
     `selector` lists only inside the elements it matches. `click_at` clicks the point `x`,`y` of the
-    visible page, in the CSS pixels of a screenshot with `full_page` false. A viewport screenshot with `track`
+    visible page, in the CSS pixels of a screenshot with `full_page` false. `scroll` with `dx`/`dy` turns the
+    mouse wheel by that many CSS pixels (positive `dy` goes down) over a `ref`/`selector` element, the point
+    `x`,`y`, or else the middle of the visible page, and says which area moved; with only an element, it scrolls
+    that element into view. A viewport screenshot with `track`
     returns a `capture_id`; `elements` with `x`, `y` and that `capture_id` lists, with a ref, the control at that
     point of the screenshot if it is still the element shown there.
     """
@@ -276,11 +282,13 @@ async def browser_inspect(
             caller.require("inspect.persistent")
         if frame_id is not None and action not in FRAME_ACTIONS:
             raise WorkerError("frame_id is unsupported for this action")
-        if ref is not None and (action not in {"click", "type", "screenshot"} or selector is not None or frame_id is not None):
-            raise WorkerError("ref replaces selector and frame_id for click, type and screenshot")
+        if ref is not None and (action not in {"click", "type", "screenshot", "scroll"} or selector is not None or frame_id is not None):
+            raise WorkerError("ref replaces selector and frame_id for click, type, screenshot and scroll")
         pointed = x is not None or y is not None
-        if (action == "click_at" and not pointed) or (pointed and (action not in {"click_at", "elements"} or None in (x, y))):
-            raise WorkerError("x and y go together, for click_at or elements at a point")
+        if (action == "click_at" and not pointed) or (pointed and (action not in {"click_at", "elements", "scroll"} or None in (x, y))):
+            raise WorkerError("x and y go together, for click_at, scroll, or elements at a point")
+        if (dx is not None or dy is not None) and action != "scroll":
+            raise WorkerError("dx and dy are only for scroll")
         if (capture_id is not None) != (action == "elements" and pointed) or (track and action != "screenshot"):
             raise WorkerError("elements at a point needs its screenshot's capture_id; track is only for screenshot")
         if frame_id is not None:
@@ -421,6 +429,27 @@ async def browser_inspect(
             if not (math.isfinite(x) and math.isfinite(y)):  # type: ignore[arg-type]
                 raise WorkerError("x and y must be finite")
             params["x"], params["y"] = x, y
+        elif action == "scroll":
+            caller.require("inspect.interact")
+            targeted = selector is not None or ref is not None
+            if pointed and targeted:
+                raise WorkerError("scroll goes over an element or a point, not both")
+            if frame_id is not None and selector is None:
+                raise WorkerError("frame_id is for a scroll selector")
+            if not (math.isfinite(dx or 0) and math.isfinite(dy or 0)):
+                raise WorkerError("dx and dy must be finite")
+            if dx or dy:
+                params["dx"], params["dy"] = float(dx or 0), float(dy or 0)
+            elif not targeted:
+                raise WorkerError("scroll needs dx or dy, or an element to bring into view")
+            elif dx is not None or dy is not None:
+                raise WorkerError("a zero scroll moves nothing")
+            if targeted:
+                _target_params(params, selector, ref)
+            elif pointed:
+                if not (math.isfinite(x) and math.isfinite(y)):  # type: ignore[arg-type]
+                    raise WorkerError("x and y must be finite")
+                params["x"], params["y"] = x, y
         elif action == "type":
             caller.require("inspect.interact")
             _target_params(params, selector, ref)

@@ -493,6 +493,53 @@ async def test_click_at_clicks_a_visible_point_and_says_what_it_hit(browser):
 
 
 @pytest.mark.browser
+async def test_scroll_turns_the_wheel_over_the_page_an_area_or_an_element_and_brings_elements_into_view(browser):
+    _, sid, page, _, _ = browser
+    await page.evaluate('''() => {
+      document.body.style.margin = 0;
+      document.body.innerHTML = '<div id=list style="position:absolute;left:0;top:0;width:400px;height:300px;overflow:auto">' +
+        '<div id=row style="height:2000px">Rows</div></div>' +
+        '<iframe style="position:absolute;left:1000px;top:600px;width:200px;height:200px"></iframe>' +
+        '<div id=far style="position:absolute;top:5000px;height:100px">Far</div>';
+    }''')
+    token = auth._current_caller.set(Caller("research", frozenset({"inspect.read", "inspect.interact"})))
+    try:
+        # Over an element: the area holding it moves, not the page.
+        listed = await call(sid, "scroll", selector="#row", dy=500)
+        assert listed["status"] == "ok" and listed["scrolled"] == {
+            "area": "area", "moved": True, "x": 0, "y": 500, "max_x": 0, "max_y": 1700,
+        }
+        assert await page.evaluate("[scrollY, document.querySelector('#list').scrollTop]") == [0, 500]
+        # By default, over the middle of the visible page.
+        down = await call(sid, "scroll", dy=800)
+        assert down["scrolled"] == {"area": "page", "moved": True, "x": 0, "y": 800, "max_x": 0, "max_y": 4200}
+        assert down["tabs"] and await page.evaluate("scrollY") == 800
+        top = await call(sid, "scroll", dy=-10000)
+        assert top["scrolled"]["y"] == 0 and top["scrolled"]["moved"] is True
+        # At the end, a scroll says nothing moved.
+        assert (await call(sid, "scroll", dy=-500))["scrolled"] == {
+            "area": "page", "moved": False, "x": 0, "y": 0, "max_x": 0, "max_y": 4200,
+        }
+        # Only an element: it is brought into view.
+        far = await call(sid, "scroll", selector="#far")
+        assert far["status"] == "ok" and "scrolled" not in far and await page.evaluate("scrollY") > 4000
+        await page.evaluate("scrollTo(0, 0)")
+        assert (await call(sid, "scroll", x=1100, y=700, dy=100))["code"] == "point_in_frame"
+        assert (await call(sid, "scroll", x=10, y=10, dy=100))["scrolled"]["area"] == "area"
+        for fields in [{}, {"dy": 0}, {"selector": "#far", "dy": 0}, {"x": 10, "dy": 100},
+                       {"x": 10, "y": 10, "selector": "#far", "dy": 100}, {"frame_id": "f", "dy": 100}]:
+            assert (await call(sid, "scroll", **fields))["code"] == "invalid_request", fields
+        assert (await call(sid, "click", selector="#far", dy=100))["code"] == "invalid_request"
+    finally:
+        auth._current_caller.reset(token)
+    token = auth._current_caller.set(Caller("research", frozenset({"inspect.read"})))
+    try:
+        assert (await call(sid, "scroll", dy=100))["code"] == "capability_denied"
+    finally:
+        auth._current_caller.reset(token)
+
+
+@pytest.mark.browser
 async def test_elements_at_a_point_of_a_tracked_screenshot_gives_the_control_it_showed_there(browser):
     _, sid, page, _, _ = browser
     await page.evaluate('''() => {

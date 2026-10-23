@@ -251,6 +251,54 @@ _AT_POINT_ROW = """(el, control) => {""" + _DOM_HELPERS + """
     type: (el.getAttribute('type') || '').slice(0, 100), href: (el.matches('a[href]') ? el.href : '').slice(0, 8192)};
 }"""
 _CONTROL_QUERY = 'a[href],button,input:not([type="hidden"]),textarea,select,summary,label,[role],[tabindex],[onclick],[contenteditable="true"]'
+# The element a point of the visible page lands on, through open shadow roots; null outside the page.
+_POINT_HIT = """([x, y]) => {
+  if (x >= innerWidth || y >= innerHeight) return null;
+  let el = document.elementFromPoint(x, y);
+  for (let inner; el?.shadowRoot && (inner = el.shadowRoot.elementFromPoint(x, y)) && inner !== el;) el = inner;
+  return el;
+}"""
+# The area a wheel turned over an element moves: its nearest scrollable ancestor (through shadow hosts) with
+# room left that way, else its document's page. A body whose overflow went to the page isn't an area itself.
+_SCROLLER = """(start, [dx, dy]) => {
+  const page = document.scrollingElement || document.documentElement;
+  const room = (overflow, at, client, size, delta) =>
+    delta !== 0 && /auto|scroll|overlay/.test(overflow) && size > client && (delta > 0 ? at + client < size - 1 : at > 0);
+  for (let n = start; n && n !== page; n = n.parentElement || n.getRootNode().host) {
+    if (n === document.body && getComputedStyle(page).overflow === 'visible') continue;
+    const style = getComputedStyle(n);
+    if (room(style.overflowY, n.scrollTop, n.clientHeight, n.scrollHeight, dy)
+        || room(style.overflowX, n.scrollLeft, n.clientWidth, n.scrollWidth, dx)) return n;
+  }
+  return page;
+}"""
+# Where a wheel over an element goes: the middle of its part inside that area and its document's visible page
+# (null when none is), with its box's corner, both in its document's pixels.
+_WHEEL_SPOT = """(el, area) => {
+  const r = el.getBoundingClientRect();
+  let [left, top, right, bottom] = [r.left, r.top, r.right, r.bottom];
+  const clip = c => { left = Math.max(left, c.left); top = Math.max(top, c.top); right = Math.min(right, c.right); bottom = Math.min(bottom, c.bottom); };
+  if (area !== (document.scrollingElement || document.documentElement)) clip(area.getBoundingClientRect());
+  clip({left: 0, top: 0, right: innerWidth, bottom: innerHeight});
+  return {origin: [r.left, r.top], spot: right > left && bottom > top ? [(left + right) / 2, (top + bottom) / 2] : null};
+}"""
+_SCROLL_POSITION = """n => ({
+  area: n !== (document.scrollingElement || document.documentElement) ? 'area' : window === top ? 'page' : 'frame',
+  at: [n.scrollLeft, n.scrollTop], max: [n.scrollWidth - n.clientWidth, n.scrollHeight - n.clientHeight],
+})"""
+# A wheel scroll can start a frame or two late and then animate: wait briefly for it to start, then for it to stop.
+_SCROLL_SETTLED = """(n, [x0, y0]) => new Promise(done => {
+  const start = performance.now();
+  let last = null, still = 0;
+  const tick = () => {
+    const at = n.scrollLeft + ',' + n.scrollTop, waited = performance.now() - start;
+    still = at === last ? still + 1 : 0;
+    last = at;
+    const moved = n.scrollLeft !== x0 || n.scrollTop !== y0;
+    if ((moved ? still >= 3 : waited >= 300) || waited >= 1500) done(); else requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+})"""
 
 
 @dataclass(slots=True)
@@ -591,10 +639,10 @@ class BrowserManager:
         return owner_frame, element, False
 
     @staticmethod
-    async def _no_child_frame_at(page: Page, x: float, y: float) -> None:
-        """A point never lands in an embedded frame, wherever it sits (a shadow root hides it from
-        elementFromPoint): a frame's own origin checks apply only through frames and frame_id."""
-        for child in page.main_frame.child_frames:
+    async def _no_child_frame_at(frame: Frame, x: float, y: float) -> None:
+        """A point of the visible page never lands in a frame embedded in `frame`, wherever it sits (a shadow
+        root hides it from elementFromPoint): a frame's own origin checks apply only through frames and frame_id."""
+        for child in frame.child_frames:
             try:
                 box = await (await child.frame_element()).bounding_box()
             except BrowserError:  # gone meanwhile
@@ -632,7 +680,7 @@ class BrowserManager:
         """The control at a point of a tracked screenshot, listed with a ref, if it is still the element that
         screenshot showed there (`stale_capture` otherwise). Acting on it then goes through its ref."""
         await check_frame_access(page, page.main_frame)
-        await self._no_child_frame_at(page, x, y)
+        await self._no_child_frame_at(page.main_frame, x, y)
         captured = session.captures.get(capture_id)
         if captured is None or captured[0] is not page:
             raise fail("stale_capture")
@@ -667,16 +715,8 @@ class BrowserManager:
     async def _click_at(self, session: BrowserSession, page: Page, x: float, y: float) -> dict[str, object]:
         """Click a point of the visible page (CSS pixels, as in a screenshot of it), and say what it hit."""
         await check_frame_access(page, page.main_frame)
-        await self._no_child_frame_at(page, x, y)
-        hit = await page.evaluate_handle(
-            """([x, y]) => {
-              if (x >= innerWidth || y >= innerHeight) return null;
-              let el = document.elementFromPoint(x, y);
-              // Into open shadow roots, to the element the click lands on.
-              for (let inner; el?.shadowRoot && (inner = el.shadowRoot.elementFromPoint(x, y)) && inner !== el;) el = inner;
-              return el;
-            }""", [x, y]
-        )
+        await self._no_child_frame_at(page.main_frame, x, y)
+        hit = await page.evaluate_handle(_POINT_HIT, [x, y])
         element = hit.as_element()
         if element is None:
             await hit.dispose()
@@ -695,6 +735,67 @@ class BrowserManager:
         except Exception as exc:
             raise WorkerError("click failed") from exc
         return {**await self._state(session), "clicked": target}
+
+    async def _scroll(
+        self, session: BrowserSession, page: Page, frame: Frame, params: dict[str, Any], timeout_ms: int,
+    ) -> dict[str, object]:
+        """Bring an element into view, or turn the mouse wheel over an element, a point, or the middle of the
+        visible page, and say how the area that took the wheel moved."""
+        dx, dy = float(params.get("dx", 0)), float(params.get("dy", 0))
+        targeted = params.get("ref") is not None or params.get("selector") is not None
+        if targeted:
+            frame, start, owned = await self._target(session, page, frame, params, timeout_ms)
+        else:
+            await check_frame_access(page, page.main_frame)
+            width, height = await page.evaluate("() => [innerWidth, innerHeight]")
+            x, y = (float(params["x"]), float(params["y"])) if "x" in params else (width / 2, height / 2)
+            hit = await page.evaluate_handle(_POINT_HIT, [x, y])
+            start, owned = hit.as_element(), True
+            if start is None:
+                await hit.dispose()
+                raise fail("point_outside")
+        scroller: JSHandle | None = None
+        try:
+            try:
+                if targeted:
+                    await start.scroll_into_view_if_needed(timeout=timeout_ms)
+                    if not (dx or dy):
+                        return await self._state(session)
+                scroller = await start.evaluate_handle(_SCROLLER, [dx, dy])
+                if targeted:
+                    # Its own document's pixels, moved by the frames it sits in to the visible page's.
+                    spot, box = await start.evaluate(_WHEEL_SPOT, scroller), await start.bounding_box()
+                    width, height = await page.evaluate("() => [innerWidth, innerHeight]")
+                    if spot["spot"] is None or box is None:
+                        raise fail("point_outside")
+                    x = spot["spot"][0] + box["x"] - spot["origin"][0]
+                    y = spot["spot"][1] + box["y"] - spot["origin"][1]
+                    if not (0 <= x < width and 0 <= y < height):
+                        raise fail("point_outside")
+                await self._no_child_frame_at(frame, x, y)
+                before = await scroller.evaluate(_SCROLL_POSITION)
+                await page.mouse.move(x, y)
+                await page.mouse.wheel(dx, dy)
+                try:
+                    async with asyncio.timeout(2):
+                        await scroller.evaluate(_SCROLL_SETTLED, before["at"])
+                except TimeoutError:  # a page that paints no frames: report where it is now
+                    pass
+                after = await scroller.evaluate(_SCROLL_POSITION)
+            except WorkerError:
+                raise
+            except Exception as exc:
+                raise WorkerError("scroll failed") from exc
+        finally:
+            if scroller is not None:
+                await scroller.dispose()
+            if owned:
+                await start.dispose()
+        (x_at, y_at), (max_x, max_y) = after["at"], after["max"]
+        return {**await self._state(session), "scrolled": {
+            "area": after["area"], "moved": after["at"] != before["at"],
+            "x": round(x_at), "y": round(y_at), "max_x": max(0, round(max_x)), "max_y": max(0, round(max_y)),
+        }}
 
     async def _no_passkey_prompt(self, page: Page) -> None:
         """Turn off Chrome's passkey prompt. A headless page can't show it, yet it takes the keyboard:
@@ -1518,6 +1619,8 @@ class BrowserManager:
                     return {"status": "ok", "session_id": session.id, "url": frame.url, "target_contenteditable": editable}
                 if action == "click_at":
                     return await self._click_at(session, page, float(params["x"]), float(params["y"]))
+                if action == "scroll":
+                    return await self._scroll(session, page, frame, params, timeout_ms)
                 if action == "wait":
                     await check_frame_access(page, frame)
                     selector = params.get("selector")
