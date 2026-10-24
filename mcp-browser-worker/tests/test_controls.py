@@ -462,13 +462,13 @@ async def test_nearby_text_never_reads_fields_or_editable_content(browser):
 
 @pytest.mark.browser
 async def test_click_at_clicks_a_visible_point_and_says_what_it_hit(browser):
-    _, sid, page, _, _ = browser
+    manager, sid, page, _, _ = browser
     await page.evaluate('''() => {
       document.body.style.margin = 0;
       document.body.innerHTML = '<button id=go style="position:absolute;left:100px;top:200px;width:80px;height:40px">Go</button>' +
         '<iframe style="position:absolute;left:300px;top:200px;width:100px;height:100px"></iframe>' +
         '<label style="position:absolute;left:500px;top:200px">Upload<input type=file></label>' +
-        '<div id=far style="position:absolute;top:3000px">Far</div>';
+        '<div id=far style="position:absolute;top:3000px;width:120px;height:30px">Far</div>';
       window.clicks = 0; document.querySelector('#go').onclick = () => window.clicks++;
     }''')
     token = auth._current_caller.set(Caller("research", frozenset({"inspect.read", "inspect.interact", "inspect.artifact"})))
@@ -483,10 +483,14 @@ async def test_click_at_clicks_a_visible_point_and_says_what_it_hit(browser):
         assert (await call(sid, "click_at", x=1439, y=1000))["code"] == "point_outside"
         assert (await call(sid, "click_at", x=140))["code"] == "invalid_request"
         assert (await call(sid, "click", selector="#go", x=1, y=1))["code"] == "invalid_request"
-        # A screenshot of an element scrolls it into view and captures the visible page.
+        # A screenshot of an element scrolls it into view and captures only that element.
         far = await call(sid, "screenshot", selector="#far")
-        assert far["status"] == "ok" and far["viewport"]["height"] == 900
+        assert far["status"] == "ok" and "viewport" not in far
         assert await page.evaluate("scrollY") > 2000
+        png = (await manager.artifacts.read("research", far["artifact"]["artifact_id"]))[1]
+        scale = await page.evaluate("devicePixelRatio")
+        assert (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")) == (120 * scale, 30 * scale)
+        assert (await call(sid, "screenshot", selector="#far", track=True))["code"] == "invalid_request"
         assert "viewport" not in await call(sid, "screenshot")
     finally:
         auth._current_caller.reset(token)

@@ -263,7 +263,7 @@ async def browser_inspect(
     cookies and sign-ins persist across sessions; without it, the session is ephemeral.
     `downloads` lists files the page downloaded, each retrievable as an artifact.
     `elements` gives each listed element a short `ref` (e.g. `e12`) that `click`, `type` and `screenshot`
-    accept instead of a selector; `text` keeps elements whose label or nearby text contains it, and
+    accept instead of a selector (a screenshot of one captures only that element); `text` keeps elements whose label or nearby text contains it, and
     `selector` lists only inside the elements it matches. `click_at` clicks the point `x`,`y` of the
     visible page, in the CSS pixels of a screenshot with `full_page` false. `scroll` with `dx`/`dy` turns the
     mouse wheel by that many CSS pixels (positive `dy` goes down) over a `ref`/`selector` element, the point
@@ -460,6 +460,8 @@ async def browser_inspect(
         elif action in {"screenshot", "export_pdf"}:
             caller.require("inspect.artifact")
             if action == "screenshot" and (selector is not None or ref is not None):
+                if track:
+                    raise WorkerError("track is only for a screenshot of the visible page")
                 _target_params(params, selector, ref)
             if track:
                 params["track"] = True

@@ -1648,16 +1648,24 @@ class BrowserManager:
                 if action == "screenshot":
                     full_page = bool(params.get("full_page", True))
                     if params.get("ref") or params.get("selector"):
-                        # Show that element: scroll it into the visible page, then capture what's visible.
-                        full_page = False
+                        # Show only that element: scrolled into view and cropped to its box.
                         frame, element, owned = await self._target(session, page, frame, params, timeout_ms)
                         try:
-                            await element.scroll_into_view_if_needed(timeout=timeout_ms)
+                            box = await element.bounding_box()
+                            if box is None:
+                                raise WorkerError("element is not visible")
+                            if box["height"] > MAX_CAPTURE_HEIGHT or box["width"] * box["height"] > MAX_CAPTURE_PIXELS:
+                                raise WorkerError("element is too large for a bounded artifact capture")
+                            data = await element.screenshot(type="png", timeout=timeout_ms)
+                        except WorkerError:
+                            raise
                         except Exception as exc:
                             raise WorkerError("screenshot failed") from exc
                         finally:
                             if owned:
                                 await element.dispose()
+                        record = await self.artifacts.create(owner, data, suffix="png", mime_type="image/png", max_bytes=MAX_SCREENSHOT_BYTES)
+                        return {"status": "ok", "session_id": session.id, "artifact": record.public()}
                     await self._ensure_capture_bounds(page)
                     capture_id = None
                     try:
