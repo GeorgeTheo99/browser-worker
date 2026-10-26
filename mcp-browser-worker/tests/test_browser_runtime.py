@@ -290,6 +290,14 @@ async def test_read_waits_for_a_self_clearing_bot_check(tmp_path: Path, monkeypa
         stuck = await manager.fetch("owner", f"http://public.test:{port}/stuck", timeout_ms=2_000, **options)
         assert stuck["title"] == "Just a moment..."
         assert "Performing security verification" in str(stuck["text"])
+
+        # A person navigating in the live view watches the check themselves: nothing holds their next input.
+        opened = await manager.open("owner", None, wait_until="domcontentloaded", timeout_ms=15_000)
+        started = asyncio.get_running_loop().time()
+        await manager.human_input(
+            "owner", str(opened["session_id"]), {"type": "navigate", "url": f"http://public.test:{port}/stuck"}
+        )
+        assert asyncio.get_running_loop().time() - started < 5
     finally:
         await manager.shutdown()
         await artifacts.close()

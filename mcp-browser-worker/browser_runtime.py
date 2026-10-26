@@ -123,30 +123,35 @@ def chromium_hardening_args() -> list[str]:
 # (its orchestrate script; sites it protects load other challenge-platform scripts on every page, never this
 # one) and DataDome's interstitial (a CAPTCHA, which wants a person, comes from its /captcha/ path instead).
 _SELF_CLEARING_CHECK = (
-    "() => !!document.querySelector('script[src*=\"/cdn-cgi/challenge-platform/\"][src*=\"/orchestrate/\"], "
-    "iframe[src*=\"captcha-delivery.com/interstitial/\"]')"
+    "() => !!document.querySelector(['chl_page', 'managed', 'jsch'].map(kind => "
+    "`script[src*=\"/cdn-cgi/challenge-platform/\"][src*=\"/orchestrate/${kind}/\"]`).join(', ') + "
+    "', iframe[src*=\"captcha-delivery.com/interstitial/\"]')"
 )
 
 
-async def settle_self_clearing_check(page: Page, timeout_seconds: float) -> None:
-    """Wait, within `timeout_seconds`, for a self-clearing bot check on `page` to reload into the site.
+async def settle_self_clearing_check(page: Page, timeout_seconds: float, wait_until: WaitUntil) -> None:
+    """Wait, within `timeout_seconds`, for a self-clearing bot check on `page` to load the site, then for the
+    site's page to reach `wait_until`.
 
     Cloudflare's check usually passes in 2-3 s and DataDome's in 6-7 s, longer than a read waits for the
     page to settle. One that wants a person (a checkbox or puzzle) stays, and the caller gets it as it is.
     """
     deadline = time.monotonic() + timeout_seconds
     checking = False
-    while time.monotonic() < deadline:
+    while not page.is_closed() and (remaining := deadline - time.monotonic()) > 0:
         try:
-            if not await page.evaluate(_SELF_CLEARING_CHECK):
-                break
+            async with asyncio.timeout(remaining):
+                if not await page.evaluate(_SELF_CLEARING_CHECK):
+                    break
             checking = True
-        except BrowserError:  # the check reloading the page replaces the document mid-evaluation
+        except BrowserError:  # the check loading the site replaces the document mid-evaluation
             checking = True
+        except TimeoutError:
+            break
         await asyncio.sleep(0.25)
-    if checking:
+    if checking and wait_until != "commit" and not page.is_closed():
         try:
-            await page.wait_for_load_state("domcontentloaded", timeout=max(1.0, deadline - time.monotonic()) * 1000)
+            await page.wait_for_load_state(wait_until, timeout=max(1.0, deadline - time.monotonic()) * 1000)
         except BrowserError:
             pass
 
@@ -850,10 +855,13 @@ class BrowserManager:
         screen; the page still renders for screenshots and the live view."""
         try:
             cdp = await page.context.new_cdp_session(page)
-            window = await cdp.send("Browser.getWindowForTarget")
-            await cdp.send(
-                "Browser.setWindowBounds", {"windowId": window["windowId"], "bounds": {"left": 100_000, "top": 100_000}}
-            )
+            try:
+                window = await cdp.send("Browser.getWindowForTarget")
+                await cdp.send(
+                    "Browser.setWindowBounds", {"windowId": window["windowId"], "bounds": {"left": 100_000, "top": 100_000}}
+                )
+            finally:
+                await cdp.detach()
         except Exception:  # a page closed before this ran needs nothing
             logger.debug("browser window left in place", exc_info=True)
 
@@ -1213,8 +1221,10 @@ class BrowserManager:
                     elif kind == "text":
                         await page.keyboard.insert_text(event["text"])
                     elif kind == "navigate":
+                        # The person watches the page themselves, so a check doesn't hold their next input.
                         await self._navigate(
-                            session, event["url"], wait_until="domcontentloaded", timeout_ms=DEFAULT_TIMEOUT_MS
+                            session, event["url"], wait_until="domcontentloaded", timeout_ms=DEFAULT_TIMEOUT_MS,
+                            settle_check=False,
                         )
                     elif kind in {"back", "forward", "reload"}:
                         move = {"back": page.go_back, "forward": page.go_forward, "reload": page.reload}[kind]
@@ -1359,18 +1369,24 @@ class BrowserManager:
         session.active_index = min(max(session.active_index, 0), len(pages) - 1)
         return pages[session.active_index]
 
-    async def _navigate(self, session: BrowserSession, url: str, *, wait_until: WaitUntil, timeout_ms: int) -> None:
+    async def _navigate(
+        self, session: BrowserSession, url: str, *, wait_until: WaitUntil, timeout_ms: int, settle_check: bool = True
+    ) -> None:
         session.controls.invalidate()
         session.approvals.invalidate()
         await resolve_public_url(url, session.proxy.resolver)
         page = self._active_page(session)
+        started = time.monotonic()
         navigation = asyncio.create_task(
             page.goto(url, wait_until=wait_until, timeout=timeout_ms),
             name=f"browser-navigate-{session.id}",
         )
         try:
             await navigation
-            await settle_self_clearing_check(page, min(CHECK_SETTLE_SECONDS, timeout_ms / 1000))
+            if settle_check:
+                # Within the call's timeout: what the navigation left of it, at most CHECK_SETTLE_SECONDS.
+                budget = min(CHECK_SETTLE_SECONDS, timeout_ms / 1000 - (time.monotonic() - started))
+                await settle_self_clearing_check(page, budget, wait_until)
             await resolve_public_url(page.url, session.proxy.resolver)
         except asyncio.CancelledError:
             navigation.cancel()
