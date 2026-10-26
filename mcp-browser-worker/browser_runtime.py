@@ -39,6 +39,7 @@ from artifacts import ArtifactStore
 from config import (
     ABSOLUTE_TTL_SECONDS,
     BROWSER_EXECUTABLE,
+    CHECK_SETTLE_SECONDS,
     DEFAULT_TIMEOUT_MS,
     DOWNLOAD_DEADLINE_SECONDS,
     HEADLESS,
@@ -116,6 +117,36 @@ def chromium_hardening_args() -> list[str]:
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--webrtc-ip-handling-policy=disable_non_proxied_udp",
     ]
+
+
+# Cloudflare's "Just a moment..." page tests the browser with its orchestrate script, then reloads into the
+# site by itself. Sites it protects load other challenge-platform scripts on every page, never this one.
+_SELF_CLEARING_CHECK = (
+    "() => !!document.querySelector('script[src*=\"/cdn-cgi/challenge-platform/\"][src*=\"/orchestrate/\"]')"
+)
+
+
+async def settle_self_clearing_check(page: Page, timeout_seconds: float) -> None:
+    """Wait, within `timeout_seconds`, for a self-clearing bot check on `page` to reload into the site.
+
+    Cloudflare's check usually passes in 2-3 s, longer than a read waits for the page to settle. One
+    that wants a person (a checkbox or puzzle) stays, and the caller gets the check page as it is.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    checking = False
+    while time.monotonic() < deadline:
+        try:
+            if not await page.evaluate(_SELF_CLEARING_CHECK):
+                break
+            checking = True
+        except BrowserError:  # the check reloading the page replaces the document mid-evaluation
+            checking = True
+        await asyncio.sleep(0.25)
+    if checking:
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=max(1.0, deadline - time.monotonic()) * 1000)
+        except BrowserError:
+            pass
 
 
 def regular_user_agent(executable: Path) -> str | None:
@@ -504,6 +535,8 @@ class BrowserManager:
             return
         session.tracked_pages.add(page)
         self._spawn(session, self._no_passkey_prompt(page), f"browser-no-passkey-prompt-{session.id}")
+        if not HEADLESS:
+            self._spawn(session, self._park_window(page), f"browser-park-window-{session.id}")
         session.approvals.invalidate()
         page.on("framenavigated", lambda frame: session.approvals.invalidate() if frame == page.main_frame else None)
         page.on("close", session.approvals.invalidate)
@@ -808,6 +841,19 @@ class BrowserManager:
             await cdp.send("WebAuthn.enable", {"enableUI": False})
         except Exception:  # a page closed before this ran needs nothing
             logger.debug("passkey prompt left on for a closed page", exc_info=True)
+
+    async def _park_window(self, page: Page) -> None:
+        """Move a windowed browser's window into the screen's bottom-right corner, where it covers almost
+        nothing. Chrome ignores an off-screen launch position and keeps a sliver of a moved window on
+        screen; the page still renders for screenshots and the live view."""
+        try:
+            cdp = await page.context.new_cdp_session(page)
+            window = await cdp.send("Browser.getWindowForTarget")
+            await cdp.send(
+                "Browser.setWindowBounds", {"windowId": window["windowId"], "bounds": {"left": 100_000, "top": 100_000}}
+            )
+        except Exception:  # a page closed before this ran needs nothing
+            logger.debug("browser window left in place", exc_info=True)
 
     def _spawn(self, session: BrowserSession, coro: Any, name: str) -> None:
         task = asyncio.create_task(coro, name=name)
@@ -1322,6 +1368,7 @@ class BrowserManager:
         )
         try:
             await navigation
+            await settle_self_clearing_check(page, min(CHECK_SETTLE_SECONDS, timeout_ms / 1000))
             await resolve_public_url(page.url, session.proxy.resolver)
         except asyncio.CancelledError:
             navigation.cancel()

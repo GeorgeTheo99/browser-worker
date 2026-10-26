@@ -36,12 +36,15 @@ PROFILES_DIR = DATA_DIR / "profiles"
 
 MCP_HOST = "127.0.0.1"
 MCP_PORT = _bounded_int("BROWSER_WORKER_PORT", 8890, 1024, 65535)
-HEADLESS = _flag("BROWSER_WORKER_HEADLESS", True)
+# A windowed browser (moved into the screen's corner) passes bot checks more often than a headless one.
+HEADLESS = _flag("BROWSER_WORKER_HEADLESS", False)
 BROWSER_EXECUTABLE = os.environ.get("BROWSER_WORKER_BROWSER_EXECUTABLE") or None
 DEFAULT_TIMEOUT_MS = _bounded_int("BROWSER_WORKER_DEFAULT_TIMEOUT_MS", 30_000, 1_000, 60_000)
 MAX_OPERATION_TIMEOUT_MS = 60_000
 VIEWPORT_WIDTH = _bounded_int("BROWSER_WORKER_VIEWPORT_WIDTH", 1440, 320, 3840)
 VIEWPORT_HEIGHT = _bounded_int("BROWSER_WORKER_VIEWPORT_HEIGHT", 900, 240, 2160)
+# How long a read waits for a bot check that clears itself (Cloudflare's "Just a moment...") to reload into the site.
+CHECK_SETTLE_SECONDS = 12
 
 MAX_GLOBAL_SESSIONS = _bounded_int("BROWSER_WORKER_MAX_GLOBAL_SESSIONS", 16, 1, 16)
 MAX_CALLER_SESSIONS = _bounded_int("BROWSER_WORKER_MAX_CALLER_SESSIONS", 8, 1, 8)

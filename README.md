@@ -55,6 +55,9 @@ credentials as production identities.
 - `BROWSER_WORKER_DEPLOY_ROOT`, `BROWSER_WORKER_DATA_DIR` — dedicated absolute private directories.
 - `BROWSER_WORKER_BROWSER_EXECUTABLE` — optional explicit browser executable; when set,
   the installer validates it rather than downloading a replacement.
+- `BROWSER_WORKER_HEADLESS` — default off: Chromium runs windowed, which passes bot checks more
+  often, with each window moved into the screen's bottom-right corner (a sliver stays visible; it
+  needs the user's GUI session). Set `1` in the launchd plist's environment, which installs keep, for headless.
 - Run `scripts/browser-worker env` for resolved non-secret paths, including the actual
   production token path. Tokens are never printed.
 - Retry installation to repair missing browser cache or bootstrap missing production
