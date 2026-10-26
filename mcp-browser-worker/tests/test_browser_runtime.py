@@ -249,7 +249,12 @@ async def test_read_waits_for_a_self_clearing_bot_check(tmp_path: Path, monkeypa
     pages = {
         "/check": check.replace(b"KIND", b"pass"),
         "/stuck": check.replace(b"KIND", b"stay"),
+        # An older form of the same check, and a protected site's own page, which loads another of its scripts.
+        "/managed": check.replace(b"chl_page/v1?KIND", b"managed/v1?pass"),
+        "/protected": b"<!doctype html><title>Protected</title><body><p>Protected page</p>"
+        b"<script src=/cdn-cgi/challenge-platform/h/b/scripts/jsd/main.js></script></body>",
         "/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?pass": b"setTimeout(() => location.replace('/site'), 1200)",
+        "/cdn-cgi/challenge-platform/h/b/orchestrate/managed/v1?pass": b"setTimeout(() => location.replace('/site'), 1200)",
         # DataDome's interstitial: an iframe that loads the site once it passes.
         "/interstitial": b"<!doctype html><title>shop.test</title><body><script>var dd={'rt':'i'}</script>"
         b"<iframe src=/x.captcha-delivery.com/interstitial/?initialCid=1></iframe>"
@@ -286,6 +291,13 @@ async def test_read_waits_for_a_self_clearing_bot_check(tmp_path: Path, monkeypa
         assert "Site page" in str(cleared["text"])
         interstitial = await manager.fetch("owner", f"http://public.test:{port}/interstitial", timeout_ms=15_000, **options)
         assert interstitial["final_url"] == f"http://public.test:{port}/site"
+        managed = await manager.fetch("owner", f"http://public.test:{port}/managed", timeout_ms=15_000, **options)
+        assert managed["final_url"] == f"http://public.test:{port}/site"
+        # A page that isn't a check doesn't wait.
+        started = asyncio.get_running_loop().time()
+        protected = await manager.fetch("owner", f"http://public.test:{port}/protected", timeout_ms=15_000, **options)
+        assert protected["title"] == "Protected"
+        assert asyncio.get_running_loop().time() - started < 6
         # A check that wants a person is returned as it is, once the wait (bounded by the call's timeout) ends.
         stuck = await manager.fetch("owner", f"http://public.test:{port}/stuck", timeout_ms=2_000, **options)
         assert stuck["title"] == "Just a moment..."
