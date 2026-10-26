@@ -250,6 +250,10 @@ async def test_read_waits_for_a_self_clearing_bot_check(tmp_path: Path, monkeypa
         "/check": check.replace(b"KIND", b"pass"),
         "/stuck": check.replace(b"KIND", b"stay"),
         "/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?pass": b"setTimeout(() => location.replace('/site'), 1200)",
+        # DataDome's interstitial: an iframe that loads the site once it passes.
+        "/interstitial": b"<!doctype html><title>shop.test</title><body><script>var dd={'rt':'i'}</script>"
+        b"<iframe src=/x.captcha-delivery.com/interstitial/?initialCid=1></iframe>"
+        b"<script>setTimeout(() => location.replace('/site'), 1200)</script></body>",
         "/site": b"<!doctype html><title>Site</title><body><p>Site page</p>"
         b"<script src=/cdn-cgi/challenge-platform/scripts/jsd/main.js></script></body>",
     }
@@ -280,6 +284,8 @@ async def test_read_waits_for_a_self_clearing_bot_check(tmp_path: Path, monkeypa
         cleared = await manager.fetch("owner", f"http://public.test:{port}/check", timeout_ms=15_000, **options)
         assert cleared["final_url"] == f"http://public.test:{port}/site"
         assert "Site page" in str(cleared["text"])
+        interstitial = await manager.fetch("owner", f"http://public.test:{port}/interstitial", timeout_ms=15_000, **options)
+        assert interstitial["final_url"] == f"http://public.test:{port}/site"
         # A check that wants a person is returned as it is, once the wait (bounded by the call's timeout) ends.
         stuck = await manager.fetch("owner", f"http://public.test:{port}/stuck", timeout_ms=2_000, **options)
         assert stuck["title"] == "Just a moment..."

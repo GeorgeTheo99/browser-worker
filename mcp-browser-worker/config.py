@@ -43,7 +43,8 @@ DEFAULT_TIMEOUT_MS = _bounded_int("BROWSER_WORKER_DEFAULT_TIMEOUT_MS", 30_000, 1
 MAX_OPERATION_TIMEOUT_MS = 60_000
 VIEWPORT_WIDTH = _bounded_int("BROWSER_WORKER_VIEWPORT_WIDTH", 1440, 320, 3840)
 VIEWPORT_HEIGHT = _bounded_int("BROWSER_WORKER_VIEWPORT_HEIGHT", 900, 240, 2160)
-# How long a read waits for a bot check that clears itself (Cloudflare's "Just a moment...") to reload into the site.
+# How long a read waits for a bot check that clears itself (Cloudflare's "Just a moment...", DataDome's
+# interstitial) to load the site.
 CHECK_SETTLE_SECONDS = 12
 
 MAX_GLOBAL_SESSIONS = _bounded_int("BROWSER_WORKER_MAX_GLOBAL_SESSIONS", 16, 1, 16)

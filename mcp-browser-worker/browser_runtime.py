@@ -119,18 +119,20 @@ def chromium_hardening_args() -> list[str]:
     ]
 
 
-# Cloudflare's "Just a moment..." page tests the browser with its orchestrate script, then reloads into the
-# site by itself. Sites it protects load other challenge-platform scripts on every page, never this one.
+# Bot checks that test the browser and then load the site by themselves: Cloudflare's "Just a moment..." page
+# (its orchestrate script; sites it protects load other challenge-platform scripts on every page, never this
+# one) and DataDome's interstitial (a CAPTCHA, which wants a person, comes from its /captcha/ path instead).
 _SELF_CLEARING_CHECK = (
-    "() => !!document.querySelector('script[src*=\"/cdn-cgi/challenge-platform/\"][src*=\"/orchestrate/\"]')"
+    "() => !!document.querySelector('script[src*=\"/cdn-cgi/challenge-platform/\"][src*=\"/orchestrate/\"], "
+    "iframe[src*=\"captcha-delivery.com/interstitial/\"]')"
 )
 
 
 async def settle_self_clearing_check(page: Page, timeout_seconds: float) -> None:
     """Wait, within `timeout_seconds`, for a self-clearing bot check on `page` to reload into the site.
 
-    Cloudflare's check usually passes in 2-3 s, longer than a read waits for the page to settle. One
-    that wants a person (a checkbox or puzzle) stays, and the caller gets the check page as it is.
+    Cloudflare's check usually passes in 2-3 s and DataDome's in 6-7 s, longer than a read waits for the
+    page to settle. One that wants a person (a checkbox or puzzle) stays, and the caller gets it as it is.
     """
     deadline = time.monotonic() + timeout_seconds
     checking = False
