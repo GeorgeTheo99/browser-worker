@@ -56,6 +56,7 @@ Actions:
 - Artifacts: `screenshot`, `export_pdf`, `downloads` (explicit `inspect.download` grant)
 - Server-mediated confirmation capability: `prepare_action`, `execute_prepared`, `discard_prepared`
 - Interactive Pi capability: `click`, `type`, `click_at`, `scroll`
+- File upload: `upload` (explicit `inspect.upload` grant)
 - Privileged Pi-only capability: `evaluate`
 
 Common fields are optional at the JSON-Schema layer for model compatibility and strictly checked per action: `session_id`, `scope_id`, `url`, `selector`, `ref`, `x`, `y`, `capture_id`, `track`, `frame_id`, `control_id`, `option`, `text`, `tab_index`, `timeout_ms`, `wait_until`, `state`, `url_contains`, `max_chars`, `limit`, `clear`, `submit`, `full_page`, `format`, `landscape`, `print_background`, `script`, `arg`, `operation`, and `proposal_id`.
@@ -67,6 +68,7 @@ Common fields are optional at the JSON-Schema layer for model compatibility and 
 - **Durable profile** (`inspect.persistent`): `open` with `profile` (`^[a-z0-9][a-z0-9_-]{0,63}$`, e.g. `default`) launches Chromium on an owner-only profile directory under `profiles/<sha256(caller)[:32]>/<profile>`. Cookies, storage, and sign-ins persist across sessions and worker restarts. While a session for that caller/profile is live, `open` reattaches to it (`reattached: true`, optional `url` navigates) instead of launching a second browser. Durable sessions are not scope-bound (`scope_id` is rejected), expire after 30 minutes idle or 8 hours total (`BROWSER_WORKER_PERSISTENT_*_TTL_SECONDS`), and their profile is retained on close/expiry; a relaunch waits for the previous context to release the profile. Watching the live view counts as activity. Ephemeral sessions are unchanged. Public-network egress applies identically; a profile is not a credential vault and the worker never exposes cookies or profile files.
 - **Delete a durable profile** (`inspect.persistent`): `delete_profile` with only `profile` closes the caller's live session of that profile, if any, and deletes its directory, so the next `open` starts signed out. It returns `{status:"deleted",profile,closed}`; deleting a profile that doesn't exist succeeds, and an `open` racing the delete gets `session_busy`.
 - **Downloads** (`inspect.download`): sessions opened by such a caller accept downloads into a per-session owner-only directory. Each completed download (≤ 50 MiB, ≤ 300 s, cancelled when the in-flight directory exceeds the cap) becomes an owner-bound artifact with a sanitized `filename` and extension-derived MIME type, served as an attachment with `nosniff` and a sandbox CSP. `downloads` returns at most the 20 latest `{download_id, filename, url, status: in_progress|completed|failed, artifact?, error?}` rows. Download bytes count toward the caller artifact quota and 30-minute artifact TTL; clients must retain them promptly. Without the grant, downloads are cancelled as before.
+- **Upload** (`inspect.upload`): `upload` with a `ref`/`selector` (and optional `frame_id`) and `files`, 1–5 `{name, mime_type, data}` with base64 `data`, at most 20 MiB decoded in total. The bytes travel in the call; the worker never offers a file from its own disk. A target that is a file input, or a label for one, gets the files directly; any other target is clicked and the files go to the file picker it opens within 5 s (else `no file picker opened`). Names are sanitized like download names. A non-`multiple` input given several files fails (`upload failed`). Returns `{status, session_id, url, files}`. Click and type keep refusing file-upload targets.
 - **Live view** (`inspect.live`), plain authenticated HTTP routes beside `/mcp`, owner-bound like artifacts:
   - `GET /sessions` → `{status, sessions:[{session_id, profile, persistent, url, tab_count, idle_expires_in_seconds}]}`.
   - `GET /sessions/{id}/live` → `text/event-stream` of `state` (`{url, active_tab, tab_count}`), `frame` (`{seq, data: base64 JPEG, width, height}` in CSS viewport pixels, at most ~10/s, latest-wins), and a final `closed`; `: keepalive` comments every 15 s. A Chromium CDP screencast follows the active tab and runs only while at least one of at most 4 viewers is attached.
@@ -136,6 +138,7 @@ Capability tiers:
 | `inspect.script` | page evaluation |
 | `inspect.persistent` | `open` with a durable named `profile`, and `delete_profile` |
 | `inspect.download` | accept page downloads as artifacts; `downloads` listing |
+| `inspect.upload` | `upload`: put caller-supplied files in a page's file input or file picker |
 | `inspect.live` | `/sessions` listing, live screencast stream, and human input routes |
 
 Client policy:

@@ -18,7 +18,7 @@ MAX_FRAMES = 100
 MAX_FRAME_DEPTH = 32
 FRAME_ACTIONS = frozenset({
     'elements', 'extract_text', 'extract_links', 'prepare_action',
-    'click', 'type', 'evaluate', 'wait', 'scroll',
+    'click', 'type', 'evaluate', 'wait', 'scroll', 'upload',
 })
 
 # Installed before site listeners. Closure-owned authority cannot be reset by

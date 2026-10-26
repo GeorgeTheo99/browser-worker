@@ -22,6 +22,7 @@ VALID_CAPABILITIES = frozenset(
         "inspect.script",
         "inspect.persistent",
         "inspect.download",
+        "inspect.upload",
         "inspect.live",
     }
 )

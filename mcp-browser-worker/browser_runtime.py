@@ -138,6 +138,9 @@ def regular_user_agent(executable: Path) -> str | None:
     )
 
 
+# Files one `upload` may put in a page, and their total size.
+MAX_UPLOAD_FILES = 5
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 # Element references a session remembers (oldest go first), so a re-listed element keeps its own.
 MAX_ELEMENT_REFS = 1000
 # Tracked screenshot layouts a session keeps, and the elements one remembers.
@@ -1374,6 +1377,45 @@ class BrowserManager:
         if width < 1 or height < 1 or height > MAX_CAPTURE_HEIGHT or width * height > MAX_CAPTURE_PIXELS:
             raise WorkerError("page is too large for a bounded artifact capture")
 
+    async def _upload(
+        self, session: BrowserSession, page: Page, frame: Frame, params: dict[str, Any], timeout_ms: int,
+    ) -> dict[str, object]:
+        """Put the caller's files in a file input (the target, or the input its label is for), or else in the
+        file picker that clicking the target opens. Nothing on the worker's disk is ever offered."""
+        frame, element, owned = await self._target(session, page, frame, params, timeout_ms)
+        file_input: ElementHandle | None = None
+        try:
+            if await element.owner_frame() != frame:
+                raise fail("invalid_request")
+            handle = await element.evaluate_handle(
+                """el => el.matches('input[type="file"]') ? el
+                  : (el.control && el.control.matches('input[type="file"]') ? el.control : null)"""
+            )
+            file_input = handle.as_element()
+            if file_input is None:
+                await handle.dispose()
+            files = params["files"]
+            try:
+                if file_input is not None:
+                    await file_input.set_input_files(files, timeout=timeout_ms)
+                else:
+                    async with page.expect_file_chooser(timeout=min(timeout_ms, 5000)) as chooser_info:
+                        await element.click(timeout=timeout_ms)
+                    chooser = await chooser_info.value
+                    await chooser.set_files(files, timeout=timeout_ms)
+            except BrowserTimeoutError as exc:
+                raise WorkerError("no file picker opened; target the file input or the button that opens it") from exc
+            except BrowserError as exc:
+                raise WorkerError("upload failed") from exc
+        finally:
+            if file_input is not None:
+                await file_input.dispose()
+            if owned:
+                await element.dispose()
+        session.controls.invalidate()
+        session.approvals.invalidate()
+        return {"status": "ok", "session_id": session.id, "url": frame.url, "files": len(files)}
+
     @staticmethod
     async def _no_upload(element: ElementHandle) -> None:
         if await element.evaluate('''el => {
@@ -1617,6 +1659,8 @@ class BrowserManager:
                         if element is not None and owned:
                             await element.dispose()
                     return {"status": "ok", "session_id": session.id, "url": frame.url, "target_contenteditable": editable}
+                if action == "upload":
+                    return await self._upload(session, page, frame, params, timeout_ms)
                 if action == "click_at":
                     return await self._click_at(session, page, float(params["x"]), float(params["y"]))
                 if action == "scroll":

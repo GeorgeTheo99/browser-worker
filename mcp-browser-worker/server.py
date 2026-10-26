@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import math
@@ -11,14 +13,14 @@ from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from approvals import MAX_ARG_BYTES
 from artifacts import ArtifactError, ArtifactStore
 from auth import Caller, ClientRegistry, current_caller
-from browser_runtime import BrowserManager, WorkerError
+from browser_runtime import MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, BrowserManager, WorkerError, safe_download_name
 from config import (
     ARTIFACTS_DIR,
     CLIENTS_CONFIG,
@@ -67,6 +69,7 @@ InspectAction = Literal[
     "click_at",
     "scroll",
     "type",
+    "upload",
     "evaluate",
 ]
 WaitUntil = Literal["load", "domcontentloaded", "networkidle", "commit"]
@@ -210,6 +213,33 @@ async def browser_fetch(
     )
 
 
+class UploadFile(BaseModel):
+    """One file for `upload`: its bytes travel in the call, never as a path on the worker."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: Annotated[str, Field(min_length=1, max_length=200)]
+    mime_type: Annotated[str, Field(min_length=3, max_length=100, pattern=r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$")]
+    data: Annotated[str, Field(min_length=1, max_length=(MAX_UPLOAD_BYTES * 4) // 3 + 4)]
+
+
+def _upload_payloads(files: list[UploadFile] | None) -> list[dict[str, Any]]:
+    """Decode `upload`'s files into browser payloads, bounded in count and total size."""
+    if not files or len(files) > MAX_UPLOAD_FILES:
+        raise WorkerError(f"upload takes 1 to {MAX_UPLOAD_FILES} files")
+    payloads: list[dict[str, Any]] = []
+    total = 0
+    for item in files:
+        try:
+            data = base64.b64decode(item.data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise WorkerError("file data must be base64") from exc
+        total += len(data)
+        if not data or total > MAX_UPLOAD_BYTES:
+            raise WorkerError("upload files are empty or too large")
+        payloads.append({"name": safe_download_name(item.name), "mimeType": item.mime_type.lower(), "buffer": data})
+    return payloads
+
+
 def _target_params(params: dict[str, Any], selector: str | None, ref: str | None) -> None:
     """An action's element: a `ref` from `elements`, or else a selector."""
     if ref is not None:
@@ -253,6 +283,7 @@ async def browser_inspect(
     arg: Any | None = None,
     operation: Literal["click", "type", "evaluate"] | None = None,
     proposal_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
+    files: Annotated[list[UploadFile] | None, Field(min_length=1, max_length=MAX_UPLOAD_FILES)] = None,
     profile: Annotated[
         str | None, Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     ] = None,
@@ -262,7 +293,9 @@ async def browser_inspect(
     `open` with `profile` reattaches to (or launches) a durable named browser profile whose
     cookies and sign-ins persist across sessions; without it, the session is ephemeral.
     `downloads` lists files the page downloaded, each retrievable as an artifact.
-    `elements` gives each listed element a short `ref` (e.g. `e12`) that `click`, `type` and `screenshot`
+    `upload` puts `files` (name, MIME type, base64 data) in a ref/selector file input, or in the file
+    picker that clicking the ref/selector element opens.
+    `elements` gives each listed element a short `ref` (e.g. `e12`) that `click`, `type`, `upload` and `screenshot`
     accept instead of a selector (a screenshot of one captures only that element); `text` keeps elements whose label or nearby text contains it, and
     `selector` lists only inside the elements it matches. `click_at` clicks the point `x`,`y` of the
     visible page, in the CSS pixels of a screenshot with `full_page` false. `scroll` with `dx`/`dy` turns the
@@ -282,8 +315,10 @@ async def browser_inspect(
             caller.require("inspect.persistent")
         if frame_id is not None and action not in FRAME_ACTIONS:
             raise WorkerError("frame_id is unsupported for this action")
-        if ref is not None and (action not in {"click", "type", "screenshot", "scroll"} or selector is not None or frame_id is not None):
-            raise WorkerError("ref replaces selector and frame_id for click, type, screenshot and scroll")
+        if ref is not None and (action not in {"click", "type", "upload", "screenshot", "scroll"} or selector is not None or frame_id is not None):
+            raise WorkerError("ref replaces selector and frame_id for click, type, upload, screenshot and scroll")
+        if (files is not None) != (action == "upload"):
+            raise WorkerError("files go with upload, and upload needs files")
         pointed = x is not None or y is not None
         if (action == "click_at" and not pointed) or (pointed and (action not in {"click_at", "elements", "scroll"} or None in (x, y))):
             raise WorkerError("x and y go together, for click_at, scroll, or elements at a point")
@@ -454,6 +489,10 @@ async def browser_inspect(
             caller.require("inspect.interact")
             _target_params(params, selector, ref)
             params["text"] = _bounded_text(text, name="text", maximum=20_000, required=True)
+        elif action == "upload":
+            caller.require("inspect.upload")
+            _target_params(params, selector, ref)
+            params["files"] = _upload_payloads(files)
         elif action == "wait":
             params["selector"] = _bounded_text(selector, name="selector", maximum=2000)
             params["url_contains"] = _bounded_text(url_contains, name="url_contains", maximum=2000)

@@ -26,7 +26,7 @@ def test_exact_two_tool_inventory_and_closed_schemas() -> None:
     assert "scroll" in actions
     assert {properties[key]["anyOf"][0]["minimum"] for key in ("dx", "dy")} == {-10_000}
     assert {properties[key]["anyOf"][0]["maximum"] for key in ("dx", "dy")} == {10_000}
-    assert "upload" not in actions
+    assert "upload" in actions and properties["files"]["anyOf"][0]["maxItems"] == 5
     assert "download" not in actions
     assert set(by_name) == {"browser_fetch", "browser_inspect"}
 
