@@ -701,3 +701,15 @@ async def test_elements_at_a_point_box_covers_everything_the_control_paints(brow
         assert row["box"] == [0, 0, 1440, 900]
     finally:
         auth._current_caller.reset(token)
+
+
+@pytest.mark.browser
+async def test_only_a_captcha_that_shows_blocks_the_page(browser):
+    _, sid, page, _, _ = browser
+    # Payment forms and ads embed invisible CAPTCHA frames; they aren't a check for a person.
+    await page.evaluate("""() => document.body.insertAdjacentHTML('beforeend',
+      '<iframe src="/hcaptcha-invisible" style="display:none"></iframe><iframe src="/recaptcha/anchor" width=0 height=0></iframe>')""")
+    assert (await call(sid, "extract_text"))["status"] == "ok"
+    await page.evaluate("""() => document.body.insertAdjacentHTML('beforeend',
+      '<div class=g-recaptcha style="width:304px;height:78px"></div>')""")
+    assert (await call(sid, "extract_text"))["code"] == "blocked_access"

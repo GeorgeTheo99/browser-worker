@@ -199,7 +199,9 @@ async def test_extraction_cannot_enter_unchecked_child_with_selector(framed, act
     result = await call(sid, action, frame_id=rows[1]['frame_id'], selector=through_one)
     assert result['code'] == 'invalid_selector'
     assert (await call(sid, action, frame_id=rows[-1]['frame_id'], selector=selector))['code'] == 'blocked_access'
-    assert (await call(sid, 'frames'))['code'] == 'blocked_access'
+    # Discovery leaves the blocked frame out and still lists the rest.
+    listed = await call(sid, 'frames')
+    assert listed['status'] == 'ok' and [row['url'] for row in listed['frames']] == [row['url'] for row in rows[:-1]]
     # Same-origin DOM access is not an exception to the explicit frame boundary.
     await child.evaluate("document.title='Access denied'")
     assert (await call(sid, action, selector=through_one))['code'] == 'invalid_selector'
@@ -366,9 +368,11 @@ async def test_frames_limit_and_private_child_are_not_public(framed):
       f.onload=()=>resolve(); f.onerror=()=>resolve(); document.body.append(f);
     })''', url.replace('public.test', '127.0.0.1') + 'private-frame')
     # The proxy does not fetch private content; the resulting browser error
-    # document is also not treated as public frame content.
+    # document is also not treated as public frame content: it isn't listed, the page's other frames are.
     assert not any(b' /private-frame ' in request for request in requests)
-    assert (await call(sid, 'frames'))['status'] == 'error'
+    listed = await call(sid, 'frames')
+    assert listed['status'] == 'ok' and len(listed['frames']) == 3
+    assert not any('private-frame' in row['url'] for row in listed['frames'])
 
 
 async def test_frame_ancestry_is_checked_between_native_input_and_enter(framed):

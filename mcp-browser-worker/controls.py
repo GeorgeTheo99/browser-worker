@@ -75,10 +75,13 @@ _INSPECT = r"""el => {
     selection, options, expanded: native ? false : !!(box && visible(box)), truncated}, nodes};
 }"""
 
+# A CAPTCHA widget counts only when it shows: payment forms (Stripe's invisible hCaptcha) and ads embed hidden ones.
 _BLOCKED = r"""() => {
   const title = document.title.slice(0, 500);
   const body = (document.body?.innerText || '').slice(0, 8000);
-  return !!document.querySelector('#cf-challenge-running,#challenge-form,.g-recaptcha,iframe[src*="captcha"]') ||
+  const shown = e => { const r = e.getBoundingClientRect(); return r.width >= 30 && r.height >= 30 && e.checkVisibility({visibilityProperty: true}); };
+  return !!document.querySelector('#cf-challenge-running,#challenge-form') ||
+    Array.from(document.querySelectorAll('.g-recaptcha,iframe[src*="captcha"]')).some(shown) ||
     /access denied|just a moment|attention required|security verification/i.test(title) ||
     /verify (?:that )?you are human|checking your browser|unusual traffic from your computer/i.test(body);
 }"""

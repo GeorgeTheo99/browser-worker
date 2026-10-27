@@ -157,7 +157,15 @@ class FrameStore:
                 chain = ancestry(frame)
                 if frame.parent_frame is not None and frame.parent_frame not in ids:
                     continue
-                await check_frame_access(page, frame)
+                if frame is page.main_frame:
+                    await check_frame_access(page, frame)
+                else:
+                    try:
+                        await check_frame_access(page, frame)
+                    except (WorkerError, NetworkPolicyError, Error):
+                        # A frame no one may use (a private or blocked document, an ad's check, one gone meanwhile)
+                        # is left out with the frames inside it; the rest of the page's frames are still listed.
+                        continue
                 same = kept.pop(frame, None)
                 if same is not None:
                     self.refs[same.id] = same
