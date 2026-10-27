@@ -11,7 +11,7 @@ from starlette.middleware import Middleware
 from starlette.responses import PlainTextResponse
 
 from auth import BearerAuthMiddleware
-from config import MCP_HOST, MCP_PORT
+from config import MCP_HOST, MCP_PORT, MCP_SOCKET
 from server import mcp, registry
 
 LOG_LEVEL = os.environ.get("BROWSER_WORKER_LOG_LEVEL", "INFO").upper()
@@ -89,10 +89,10 @@ def build_app():
 def main() -> None:
     import uvicorn
 
+    address = {"uds": MCP_SOCKET} if MCP_SOCKET else {"host": MCP_HOST, "port": MCP_PORT}
     uvicorn.run(
         build_app(),
-        host=MCP_HOST,
-        port=MCP_PORT,
+        **address,
         log_level=LOG_LEVEL.lower(),
         access_log=False,
     )

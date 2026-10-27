@@ -4,15 +4,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 MCP_DIR="$ROOT_DIR/mcp-browser-worker"
-DEPLOY_ROOT="${BROWSER_WORKER_DEPLOY_ROOT:-$HOME/srv/browser-worker}"
+# `vm` runs the worker and its Chromium in a Linux VM (Apple container, vm/host.py) instead of on this
+# Mac. It is a separate install (its own service, paths and callers), so both can run side by side.
+MODE="${BROWSER_WORKER_MODE:-host}"
+case "$MODE" in
+  host) SERVICE="browser-worker" ;;
+  vm) SERVICE="browser-worker-vm" ;;
+  *) printf '✗ BROWSER_WORKER_MODE must be host or vm\n' >&2; exit 2 ;;
+esac
+DEPLOY_ROOT="${BROWSER_WORKER_DEPLOY_ROOT:-$HOME/srv/$SERVICE}"
 RELEASES_DIR="$DEPLOY_ROOT/releases"
 CURRENT_LINK="$DEPLOY_ROOT/current"
 DATA_DIR="${BROWSER_WORKER_DATA_DIR:-$DEPLOY_ROOT/shared}"
 PORT="${BROWSER_WORKER_PORT:-8890}"
 INSTALLED_PORT="$PORT"
-LABEL="com.local.mcp-browser-worker"
+LABEL="com.local.mcp-$SERVICE"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG_DIR="${BROWSER_WORKER_LOG_DIR:-$HOME/Library/Logs/browser-worker}"
+LOG_DIR="${BROWSER_WORKER_LOG_DIR:-$HOME/Library/Logs/$SERVICE}"
+CONTAINER="${BROWSER_WORKER_CONTAINER_CLI:-/usr/local/bin/container}"
 PYTHON="$CURRENT_LINK/mcp-browser-worker/.venv/bin/python"
 REVISION=""
 BOOTSTRAP_PYTHON=""
@@ -37,7 +46,7 @@ bootstrap_python() {
 
 load_installed_paths() {
   local saved key value
-  saved="$("$BOOTSTRAP_PYTHON" - "$PLIST" <<'PY'
+  saved="$("$BOOTSTRAP_PYTHON" - "$PLIST" "$LABEL" <<'PY'
 import os, pathlib, plistlib, stat, sys
 path=pathlib.Path(sys.argv[1])
 if path.exists() or path.is_symlink():
@@ -45,7 +54,7 @@ if path.exists() or path.is_symlink():
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise SystemExit('installed plist must be private, regular and owned by this user')
     with path.open('rb') as stream: document=plistlib.load(stream)
-    if not isinstance(document,dict) or document.get('Label') != 'com.local.mcp-browser-worker':
+    if not isinstance(document,dict) or document.get('Label') != sys.argv[2]:
         raise SystemExit('installed plist is not the browser-worker service')
     env=document.get('EnvironmentVariables', {})
     if not isinstance(env,dict): raise SystemExit('invalid installed environment metadata')
@@ -192,9 +201,40 @@ prepare_release() {
     || die "browser-worker release environment missing: $release (restore/rebuild this release before retrying)"
   # Run on every install so a removed browser cache is repaired too. Do not
   # garbage-collect browser versions used by other apps or Pi's app_* tools.
-  if [ -z "$BROWSER_EXECUTABLE" ]; then
+  if [ "$MODE" = vm ]; then
+    build_vm_image "$release"
+  elif [ -z "$BROWSER_EXECUTABLE" ]; then
     log "Provisioning matching Chromium (cached installations are reused)"
     PLAYWRIGHT_SKIP_BROWSER_GC=1 "$release/mcp-browser-worker/.venv/bin/python" -m patchright install chromium
+  fi
+}
+
+vm_image() { printf 'browser-worker-vm:%s' "$REVISION"; }
+
+# The VM's image, built from the sealed release: the worker, Linux Chromium and its virtual display.
+build_vm_image() {
+  local release="$1" image
+  image="$(vm_image)"
+  if "$CONTAINER" image inspect "$image" >/dev/null 2>&1; then
+    log "VM image $image is already built"
+    return 0
+  fi
+  log "Building VM image $image (downloads Linux Chromium the first time)"
+  "$CONTAINER" build --progress plain --build-arg "BROWSER_WORKER_REVISION=$REVISION" \
+    --file "$release/vm/Containerfile" --tag "$image" "$release" >"$LOG_DIR/image-build.log" 2>&1 \
+    || die "VM image build failed; see $LOG_DIR/image-build.log"
+  # The builder VM keeps its memory until it stops.
+  "$CONTAINER" builder stop >/dev/null 2>&1 || true
+}
+
+# The installer's browser check: a real launch and render, in the VM for vm mode.
+browser_render_check() {
+  if [ "$MODE" = vm ]; then
+    "$CONTAINER" run --rm --shm-size 1g "$(vm_image)" \
+      /opt/browser-worker/.venv/bin/python /opt/browser-worker/mcp-browser-worker/operator_support.py browser --render
+  else
+    "$RELEASES_DIR/$REVISION/mcp-browser-worker/.venv/bin/python" \
+      "$RELEASES_DIR/$REVISION/mcp-browser-worker/operator_support.py" browser --render
   fi
 }
 
@@ -211,17 +251,21 @@ PY
 }
 
 plist_content() {
-  "$BOOTSTRAP_PYTHON" - "$PLIST" "$LABEL" "$PYTHON" "$CURRENT_LINK" "$DEPLOY_ROOT" "$DATA_DIR" "$REVISION" "$PORT" "$LOG_DIR" "$BROWSER_EXECUTABLE" <<'PY'
+  "$BOOTSTRAP_PYTHON" - "$PLIST" "$LABEL" "$PYTHON" "$CURRENT_LINK" "$DEPLOY_ROOT" "$DATA_DIR" "$REVISION" "$PORT" "$LOG_DIR" "$BROWSER_EXECUTABLE" "$MODE" "$CONTAINER" <<'PY'
 import pathlib, plistlib, sys
-old, label, python, current, deploy, data, revision, port, logs, browser = sys.argv[1:]
+old, label, python, current, deploy, data, revision, port, logs, browser, mode, container = sys.argv[1:]
 env = {}
 if pathlib.Path(old).is_file():
     with open(old, 'rb') as stream: env = plistlib.load(stream).get('EnvironmentVariables', {})
 env.update(BROWSER_WORKER_DATA_DIR=data, BROWSER_WORKER_DEPLOY_ROOT=deploy, BROWSER_WORKER_LOG_DIR=logs,
            BROWSER_WORKER_DEPLOY_REVISION=revision, BROWSER_WORKER_PORT=port,
            BROWSER_WORKER_BROWSER_EXECUTABLE=browser, PYTHONDONTWRITEBYTECODE='1', FASTMCP_SHOW_SERVER_BANNER='false')
-plistlib.dump({'Label':label, 'ProgramArguments':[python, current+'/mcp-browser-worker/http_server.py'],
-              'WorkingDirectory':current+'/mcp-browser-worker', 'EnvironmentVariables':env,
+program, directory = current+'/mcp-browser-worker/http_server.py', current+'/mcp-browser-worker'
+if mode == 'vm':
+    env.update(BROWSER_WORKER_VM_IMAGE='browser-worker-vm:'+revision, BROWSER_WORKER_CONTAINER_CLI=container)
+    program, directory = current+'/vm/host.py', current+'/vm'
+plistlib.dump({'Label':label, 'ProgramArguments':[python, program],
+              'WorkingDirectory':directory, 'EnvironmentVariables':env,
               'StandardOutPath':logs+'/browser-worker.log', 'StandardErrorPath':logs+'/browser-worker.log',
               'KeepAlive':True, 'RunAtLoad':True, 'ThrottleInterval':5, 'Umask':63}, sys.stdout.buffer)
 PY
@@ -274,7 +318,7 @@ verify() {
   [ -x "$PYTHON" ] && [ -f "$CURRENT_LINK/.browser-worker-revision" ] && [ -f "$CURRENT_LINK/mcp-browser-worker/operator_support.py" ] \
     || die "worker release is missing or predates production bootstrap; run $ROOT_DIR/install.sh"
   wait_live || die "browser-worker did not become live; inspect $LOG_DIR/browser-worker.log and run scripts/browser-worker start"
-  "$PYTHON" "$CURRENT_LINK/mcp-browser-worker/operator_support.py" browser
+  [ "$MODE" = vm ] || "$PYTHON" "$CURRENT_LINK/mcp-browser-worker/operator_support.py" browser
   "$PYTHON" "$CURRENT_LINK/mcp-browser-worker/operator_support.py" verify "$DATA_DIR" "$PORT" \
     "$(tr -d '\r\n' < "$CURRENT_LINK/.browser-worker-revision")" "$@"
 }
@@ -325,6 +369,7 @@ install_cmd() {
   case "${1:-}" in '') ;; --no-start) no_start=1; shift ;; *) die "usage: install [--no-start]" ;; esac
   [ $# -eq 0 ] || die "usage: install [--no-start]"
   require uv; require git; require curl; require launchctl; require plutil; require tar; require lsof
+  [ "$MODE" != vm ] || [ -x "$CONTAINER" ] || die "Apple container CLI is unavailable at $CONTAINER"
   source_revision
   ensure_private_dirs
   [ ! -L "$CURRENT_LINK" ] || previous_link="$(readlink "$CURRENT_LINK")"
@@ -341,8 +386,7 @@ install_cmd() {
   # Prepare dependencies and a real local browser render before touching the
   # current release or stopping an existing service.
   prepare_release
-  "$RELEASES_DIR/$REVISION/mcp-browser-worker/.venv/bin/python" \
-    "$RELEASES_DIR/$REVISION/mcp-browser-worker/operator_support.py" browser --render
+  browser_render_check
   ensure_clients
   activating=1
   if [ "$no_start" -eq 0 ]; then bootout; wait_port_free; fi
@@ -361,6 +405,7 @@ install_cmd() {
 status() {
   launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state/ {print "launchd: "$2; found=1; exit} END{if(!found) print "launchd: not-loaded"}'
   curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null || true; printf '\n'
+  [ "$MODE" != vm ] || "$CONTAINER" ls --all 2>/dev/null | awk 'NR == 1 || $1 == "browser-worker"'
 }
 
 case "${1:-}" in
@@ -376,7 +421,7 @@ case "${1:-}" in
   verify) shift; verify "$@" ;;
   status) status ;;
   logs) tail "${2:--50}" "$LOG_DIR/browser-worker.log" ;;
-  check) uv sync --project "$MCP_DIR" --locked --python "$BOOTSTRAP_PYTHON" >/dev/null; (cd "$MCP_DIR" && .venv/bin/ruff check . && .venv/bin/pytest -q tests); bash -n "$ROOT_DIR/install.sh" "$0"; git -C "$ROOT_DIR" diff --check ;;
+  check) uv sync --project "$MCP_DIR" --locked --python "$BOOTSTRAP_PYTHON" >/dev/null; (cd "$MCP_DIR" && .venv/bin/ruff check . ../vm && .venv/bin/pytest -q tests); bash -n "$ROOT_DIR/install.sh" "$0"; sh -n "$ROOT_DIR/vm/entrypoint.sh"; git -C "$ROOT_DIR" diff --check ;;
   env)
     production_token="$DATA_DIR/tokens/pi-production"
     if [ -x "$PYTHON" ] && [ -f "$CURRENT_LINK/mcp-browser-worker/operator_support.py" ] && [ -f "$DATA_DIR/clients.json" ]; then

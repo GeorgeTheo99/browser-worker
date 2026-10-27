@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import plistlib
+import sys
 from pathlib import Path
 
 import pytest
@@ -320,6 +321,7 @@ async def test_read_waits_for_a_self_clearing_bot_check(tmp_path: Path, monkeypa
 @pytest.mark.browser
 @pytest.mark.asyncio
 @pytest.mark.skipif(browser_runtime.HEADLESS, reason="a headless browser has no window")
+@pytest.mark.skipif(sys.platform != "darwin", reason="only a Mac's window is moved (a VM's display is unseen)")
 async def test_windowed_browser_moves_its_window_into_the_corner(tmp_path: Path) -> None:
     artifacts = ArtifactStore(tmp_path / "artifacts")
     await artifacts.start()
@@ -373,8 +375,16 @@ async def test_browser_launches_muted(tmp_path: Path) -> None:
     try:
         opened = await manager.open("owner", None, wait_until="domcontentloaded", timeout_ms=15_000)
         assert opened["session_id"]
-        ps = await asyncio.create_subprocess_exec("ps", "-ax", "-o", "command=", stdout=asyncio.subprocess.PIPE)
-        commands = (await ps.communicate())[0].decode().splitlines()
+        if sys.platform == "linux":
+            commands = []
+            for path in Path("/proc").glob("[0-9]*/cmdline"):
+                try:
+                    commands.append(path.read_bytes().replace(b"\0", b" ").decode(errors="replace"))
+                except OSError:  # a process that exited meanwhile
+                    pass
+        else:
+            ps = await asyncio.create_subprocess_exec("ps", "-ax", "-o", "command=", stdout=asyncio.subprocess.PIPE)
+            commands = (await ps.communicate())[0].decode().splitlines()
         # The browser process, found by its profile under this test's sessions dir.
         browser = [line for line in commands if f"--user-data-dir={tmp_path / 'sessions'}" in line and "--type=" not in line]
         assert browser and all("--mute-audio" in line for line in browser)

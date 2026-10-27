@@ -11,6 +11,7 @@ import re
 import secrets
 import shutil
 import stat
+import sys
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -505,8 +506,12 @@ class BrowserManager:
         args = chromium_hardening_args()
         # Bound the on-disk cache that durable profiles would otherwise accumulate.
         args.append("--disk-cache-size=104857600")
-        # The browser runs on the host Mac, and the live view is video only: keep pages' sound off the speakers.
+        # The live view is video only, so pages' sound never needs to play (on a Mac, from its speakers).
         args.append("--mute-audio")
+        if sys.platform == "linux":
+            # The worker's VM has no GPU: render WebGL with Mesa, which Chrome blocklists, not SwiftShader,
+            # which bot checks recognize.
+            args += ["--ignore-gpu-blocklist", "--use-angle=gl"]
         options: dict[str, Any] = {
             "headless": HEADLESS,
             "accept_downloads": downloads_dir is not None,
@@ -544,7 +549,8 @@ class BrowserManager:
             return
         session.tracked_pages.add(page)
         self._spawn(session, self._no_passkey_prompt(page), f"browser-no-passkey-prompt-{session.id}")
-        if not HEADLESS:
+        # On a Mac the window would cover the user's screen; on a VM's virtual display nobody sees it.
+        if not HEADLESS and sys.platform == "darwin":
             self._spawn(session, self._park_window(page), f"browser-park-window-{session.id}")
         session.approvals.invalidate()
         page.on("framenavigated", lambda frame: session.approvals.invalidate() if frame == page.main_frame else None)

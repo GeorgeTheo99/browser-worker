@@ -1,0 +1,39 @@
+# browser-worker in a Linux VM (Apple container): Chromium runs windowed on a virtual display (Xvfb), so
+# nothing shows on the Mac's screen or plays from its speakers.
+FROM python:3.12-slim-bookworm@sha256:6dd8b6dab6b3adc7812bab69eca5dbdc1a5cc690ad28306d234ffb4ef8ac9753
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+    UV_PROJECT_ENVIRONMENT=/opt/browser-worker/.venv \
+    UV_PYTHON_DOWNLOADS=never
+
+# Mesa (llvmpipe) gives WebGL a real renderer instead of SwiftShader, and PulseAudio an audio output:
+# bot checks (Cloudflare, DataDome) block a browser with SwiftShader and no audio device.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates tini xvfb libegl-mesa0 libgl1-mesa-dri libglx-mesa0 pulseaudio \
+        fonts-liberation fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir uv==0.13.5
+
+WORKDIR /opt/browser-worker/mcp-browser-worker
+COPY mcp-browser-worker/pyproject.toml mcp-browser-worker/uv.lock ./
+RUN uv sync --locked --no-dev --python /usr/local/bin/python3.12 \
+    && /opt/browser-worker/.venv/bin/python -m patchright install --with-deps --no-shell chromium \
+    && rm -rf /var/lib/apt/lists/* /root/.cache
+
+COPY mcp-browser-worker/*.py ./
+COPY vm/entrypoint.sh /opt/browser-worker/vm/entrypoint.sh
+# The worker's socket must be on the root filesystem: a published socket can't be on a tmpfs or volume.
+RUN useradd --uid 1000 --user-group --create-home worker \
+    && install -d -o worker -g worker -m 700 /var/lib/browser-worker
+
+# The release's Git revision, which /health reports and the operator checks.
+ARG BROWSER_WORKER_REVISION=development
+RUN printf '%s\n' "$BROWSER_WORKER_REVISION" > /opt/browser-worker/.browser-worker-revision
+ENV BROWSER_WORKER_DEPLOY_REVISION=$BROWSER_WORKER_REVISION \
+    BROWSER_WORKER_SOCKET=/var/lib/browser-worker/worker.sock \
+    BROWSER_WORKER_DATA_DIR=/data \
+    DISPLAY=:99
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/browser-worker/vm/entrypoint.sh"]

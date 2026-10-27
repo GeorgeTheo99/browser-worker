@@ -23,6 +23,36 @@ Pi's `app_*` local/private testing tools remain in-process and out of scope.
 
 The operator installs a locked environment inside an exact Git-archive release, writes and verifies a complete source manifest plus revision receipt, removes write permissions from the finalized snapshot, atomically selects it, and refuses dirty/uncommitted source. Health reports the deployed revision. The service has independent `/live`, `/ready`, and `/health` endpoints.
 
+## Linux VM mode
+
+`BROWSER_WORKER_MODE=vm` installs a second, separate worker that runs the worker and its Chromium in a
+Linux VM (Apple `container`; Apple silicon, macOS 26) instead of on the Mac, so no browser window shows on
+the Mac's screen and nothing reaches its speakers. Its service is `com.local.mcp-browser-worker-vm`, with
+`~/srv/browser-worker-vm` and `~/Library/Logs/browser-worker-vm`; give it its own `BROWSER_WORKER_PORT`
+to run beside the host install.
+
+- **Image.** The install builds `browser-worker-vm:<revision>` from the sealed release (`vm/Containerfile`):
+  a pinned Python base, the locked environment, Patchright's Linux Chromium, Xvfb, Mesa, PulseAudio and
+  fonts. The installer's browser check runs inside it.
+- **VM.** launchd runs `vm/host.py`, which runs the VM `browser-worker` (7 CPUs, which the guest sees as 8;
+  6 GiB; a 1 GiB `/dev/shm`) and stops it when the service stops. Sessions, durable profiles and artifacts
+  live on the volume `browser-worker-data`. The Mac's data directory, which keeps `clients.json` and the
+  tokens its callers read, is mounted read-only and copied in at start. The VM gets the Mac's time zone.
+- **Serving.** The worker listens on a Unix socket that the VM publishes to the Mac
+  (`<data>/run/worker.sock`), and `host.py` forwards `127.0.0.1:<port>` to it, so callers are unchanged. A
+  published TCP port would need macOS's Local Network permission for `container`'s helper, which a Mac
+  without anyone at it can't grant (apple/container#2029).
+- **Egress.** The VM uses `container`'s default network (NAT through the Mac, so sites see the same
+  address). The worker's proxy enforces public-only egress exactly as on the Mac; the Mac's and the LAN's
+  addresses are private and refused.
+- **Fingerprint.** Chrome reports Linux. WebGL renders with Mesa (`--ignore-gpu-blocklist --use-angle=gl`)
+  rather than SwiftShader, and a PulseAudio null sink is its audio output: without them, Cloudflare and
+  DataDome checks (G2, TripAdvisor, Etsy) blocked the VM. With them it matched the host worker on 22
+  bot-protected sites (2026-10-27).
+- **Limits.** Saved sign-ins don't carry over from the host install (Chrome encrypts cookies per OS), so
+  durable profiles start empty. The time zone is read when the VM starts. Memory the VM frees stays held
+  until it stops.
+
 ## Tool contracts
 
 All schemas reject unknown fields. Limits are enforced server-side even if a client bypasses schema validation. Results are JSON serialized into MCP text content and contain no worker filesystem paths, cookies, profile data, or raw internal errors. Page content is untrusted and may contain sensitive data. Approval previews deliberately echo the exact caller-supplied text/script/JSON for private human review; clients must not log or expose those previews to the model.

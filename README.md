@@ -80,6 +80,19 @@ scripts/browser-worker stop
 scripts/browser-worker uninstall          # retains source/private state
 ```
 
+## Linux VM mode
+
+On Apple silicon with macOS 26 and Apple's `container`, the worker and its Chromium can run in a Linux VM
+instead, so no browser window shows on the Mac and nothing plays from its speakers. It is a separate
+install with its own service, paths, callers and saved sign-ins:
+
+```bash
+BROWSER_WORKER_MODE=vm BROWSER_WORKER_PORT=8893 scripts/browser-worker install
+BROWSER_WORKER_MODE=vm scripts/browser-worker status
+```
+
+Every command takes `BROWSER_WORKER_MODE=vm`. See [architecture](docs/architecture.md#linux-vm-mode).
+
 ## Development
 
 ```bash

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import plistlib
 import shutil
 import stat
 import subprocess
@@ -258,3 +259,42 @@ def test_unrelated_port_owner_is_not_stopped(installation):
     assert result.returncode != 0
     assert "used by another service" in result.stderr
     assert "launchctl bootout" not in log.read_text()
+
+
+def test_vm_mode_builds_its_image_checks_the_browser_in_it_and_runs_the_host(installation):
+    repo, home, log, env = installation
+    container = Path(env["PATH"].split(":")[0]) / "container"
+    executable(
+        container,
+        """#!/bin/sh
+echo "container $*" >> "$EVENTS"
+case "$1" in
+ image) [ -f "$HOME/image-built" ] ;;
+ build) touch "$HOME/image-built" ;;
+esac
+""",
+    )
+    vm = {"BROWSER_WORKER_MODE": "vm", "BROWSER_WORKER_CONTAINER_CLI": str(container), "BROWSER_WORKER_PORT": "8892"}
+    result = run(installation, "install", **vm)
+    assert result.returncode == 0, result.stdout + result.stderr
+    revision = git(repo, "rev-parse", "HEAD")
+    image = f"browser-worker-vm:{revision}"
+    events = log.read_text()
+    assert f"--build-arg BROWSER_WORKER_REVISION={revision} --file" in events and f"--tag {image}" in events
+    assert f"container run --rm --shm-size 1g {image} " in events
+    assert "operator_support.py browser --render" in events
+    # Chromium lives in the VM: nothing provisions or checks one on the Mac.
+    assert "provision-browser" not in events and "check-browser" not in events
+    with (home / "Library/LaunchAgents/com.local.mcp-browser-worker-vm.plist").open("rb") as stream:
+        service = plistlib.load(stream)
+    assert service["ProgramArguments"][1] == str(home / "srv/browser-worker-vm/current/vm/host.py")
+    assert service["EnvironmentVariables"]["BROWSER_WORKER_VM_IMAGE"] == image
+    assert service["EnvironmentVariables"]["BROWSER_WORKER_DATA_DIR"] == str(home / "srv/browser-worker-vm/shared")
+    assert service["EnvironmentVariables"]["BROWSER_WORKER_PORT"] == "8892"
+    assert (home / "srv/browser-worker-vm/shared/tokens/pi-production").is_file()
+    # A separate install: the host worker's paths and service are untouched.
+    assert not (home / "srv/browser-worker").exists()
+    assert not (home / "Library/LaunchAgents/com.local.mcp-browser-worker.plist").exists()
+    # A reinstall of the same revision reuses its image.
+    assert run(installation, "install", **vm).returncode == 0
+    assert log.read_text().count("container build --progress") == 1

@@ -36,6 +36,8 @@ PROFILES_DIR = DATA_DIR / "profiles"
 
 MCP_HOST = "127.0.0.1"
 MCP_PORT = _bounded_int("BROWSER_WORKER_PORT", 8890, 1024, 65535)
+# In the worker's VM it serves a Unix socket, which the VM publishes to the Mac (vm/host.py).
+MCP_SOCKET = os.environ.get("BROWSER_WORKER_SOCKET") or None
 # A windowed browser (moved into the screen's corner) passes bot checks more often than a headless one.
 HEADLESS = _flag("BROWSER_WORKER_HEADLESS", False)
 BROWSER_EXECUTABLE = os.environ.get("BROWSER_WORKER_BROWSER_EXECUTABLE") or None
