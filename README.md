@@ -91,7 +91,10 @@ BROWSER_WORKER_MODE=vm BROWSER_WORKER_PORT=8893 scripts/browser-worker install
 BROWSER_WORKER_MODE=vm scripts/browser-worker status
 ```
 
-Every command takes `BROWSER_WORKER_MODE=vm`. See [architecture](docs/architecture.md#linux-vm-mode).
+Every command takes `BROWSER_WORKER_MODE=vm`. The VM starts on first use and stops after 30 minutes
+without a connection. See [architecture](docs/architecture.md#linux-vm-mode). An app that ships the
+worker installs it from a release archive under its own label
+([installs by an app](docs/architecture.md#installs-by-an-app)).
 
 ## Development
 

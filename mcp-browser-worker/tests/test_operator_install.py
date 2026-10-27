@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import shutil
@@ -274,11 +275,13 @@ case "$1" in
 esac
 """,
     )
-    vm = {"BROWSER_WORKER_MODE": "vm", "BROWSER_WORKER_CONTAINER_CLI": str(container), "BROWSER_WORKER_PORT": "8892"}
+    vm = {"BROWSER_WORKER_MODE": "vm", "BROWSER_WORKER_CONTAINER_CLI": str(container), "BROWSER_WORKER_PORT": "8892",
+          "BROWSER_WORKER_VM_NAME": "app-browser", "BROWSER_WORKER_VM_VOLUME": "app-browser-data",
+          "BROWSER_WORKER_VM_IDLE_MINUTES": "15", "BROWSER_WORKER_VM_IMAGE_REPO": "app-browser-vm"}
     result = run(installation, "install", **vm)
     assert result.returncode == 0, result.stdout + result.stderr
     revision = git(repo, "rev-parse", "HEAD")
-    image = f"browser-worker-vm:{revision}"
+    image = f"app-browser-vm:{revision}"
     events = log.read_text()
     assert f"--build-arg BROWSER_WORKER_REVISION={revision} --file" in events and f"--tag {image}" in events
     assert f"container run --rm --shm-size 1g {image} " in events
@@ -291,10 +294,86 @@ esac
     assert service["EnvironmentVariables"]["BROWSER_WORKER_VM_IMAGE"] == image
     assert service["EnvironmentVariables"]["BROWSER_WORKER_DATA_DIR"] == str(home / "srv/browser-worker-vm/shared")
     assert service["EnvironmentVariables"]["BROWSER_WORKER_PORT"] == "8892"
+    for key in ("BROWSER_WORKER_VM_NAME", "BROWSER_WORKER_VM_VOLUME", "BROWSER_WORKER_VM_IDLE_MINUTES",
+                "BROWSER_WORKER_VM_IMAGE_REPO"):
+        assert service["EnvironmentVariables"][key] == vm[key]
+    # Stopping the VM outlasts launchd's default 20 s.
+    assert service["ExitTimeOut"] == 60
     assert (home / "srv/browser-worker-vm/shared/tokens/pi-production").is_file()
     # A separate install: the host worker's paths and service are untouched.
     assert not (home / "srv/browser-worker").exists()
     assert not (home / "Library/LaunchAgents/com.local.mcp-browser-worker.plist").exists()
-    # A reinstall of the same revision reuses its image.
-    assert run(installation, "install", **vm).returncode == 0
+    # A reinstall of the same revision reuses its image, and keeps the VM's settings.
+    again = {key: vm[key] for key in ("BROWSER_WORKER_MODE", "BROWSER_WORKER_CONTAINER_CLI")}
+    assert run(installation, "install", **again).returncode == 0
     assert log.read_text().count("container build --progress") == 1
+    with (home / "Library/LaunchAgents/com.local.mcp-browser-worker-vm.plist").open("rb") as stream:
+        kept = plistlib.load(stream)["EnvironmentVariables"]
+    assert kept["BROWSER_WORKER_VM_NAME"] == "app-browser" and kept["BROWSER_WORKER_PORT"] == "8892"
+    assert kept["BROWSER_WORKER_VM_IMAGE"] == image
+
+
+def test_release_archive_installs_without_git_under_its_own_label(installation, tmp_path):
+    repo, home, _, env = installation
+    archive = tmp_path / "browser-worker.tar"
+    made = run(installation, "archive", str(archive))
+    assert made.returncode == 0, made.stdout + made.stderr
+    revision = git(repo, "rev-parse", "HEAD")
+    source = tmp_path / "unpacked"
+    source.mkdir()
+    subprocess.run(["tar", "-xf", str(archive), "-C", str(source)], check=True)
+    assert (source / ".browser-worker-revision").read_text() == revision + "\n"
+    assert not (source / ".git").exists()
+    # Git isn't needed (nor on PATH) to install from it.
+    nogit = Path(env["PATH"].split(":")[0])
+    executable(nogit / "git", "#!/bin/sh\necho git-must-not-be-used >&2\nexit 99\n")
+    result = subprocess.run(
+        ["bash", str(source / "scripts/browser-worker"), "install"],
+        env={**env, "BROWSER_WORKER_LABEL": "com.example.app.browser"},
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "git-must-not-be-used" not in result.stderr
+    assert os.readlink(home / "srv/browser-worker/current") == f"releases/{revision}"
+    assert (home / f"srv/browser-worker/releases/{revision}/.browser-worker-revision").read_text() == revision + "\n"
+    plist = home / "Library/LaunchAgents/com.example.app.browser.plist"
+    with plist.open("rb") as stream:
+        assert plistlib.load(stream)["Label"] == "com.example.app.browser"
+    assert not (home / "Library/LaunchAgents/com.local.mcp-browser-worker.plist").exists()
+
+    caller = subprocess.run(
+        ["bash", str(source / "scripts/browser-worker"), "caller", "myai", "fetch,inspect.read"],
+        env={**env, "BROWSER_WORKER_LABEL": "com.example.app.browser"},
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert caller.returncode == 0, caller.stdout + caller.stderr
+    assert caller.stdout.strip() == str(home / "srv/browser-worker/shared/tokens/myai")
+
+
+def test_archive_and_label_are_checked(installation, tmp_path):
+    repo, _, _, _ = installation
+    (repo / "uncommitted").write_text("x")
+    result = run(installation, "archive", str(tmp_path / "out.tar"))
+    assert result.returncode != 0 and "committed and clean" in result.stderr
+    assert not (tmp_path / "out.tar").exists()
+    result = run(installation, "status", BROWSER_WORKER_LABEL="bad label;")
+    assert result.returncode == 2 and "BROWSER_WORKER_LABEL is invalid" in result.stderr
+
+
+def test_an_apps_install_owns_its_caller(installation):
+    _, home, _, _ = installation
+    tokens = home / "srv/browser-worker/shared/tokens"
+    first = run(installation, "install", "--no-start", BROWSER_WORKER_CALLER="app:fetch,inspect.read")
+    assert first.returncode == 0, first.stdout + first.stderr
+    before = (tokens / "app").read_bytes()
+    wider = run(installation, "install", "--no-start", BROWSER_WORKER_CALLER="app:fetch,inspect.live,inspect.read")
+    assert wider.returncode == 0, wider.stdout + wider.stderr
+    clients = json.loads((home / "srv/browser-worker/shared/clients.json").read_text())["clients"]
+    assert next(row for row in clients if row["id"] == "app")["capabilities"] == ["fetch", "inspect.live", "inspect.read"]
+    assert (tokens / "app").read_bytes() == before
+    # The caller command doesn't change grants; it prints the token file of one that matches.
+    assert run(installation, "caller", "app", "fetch").returncode != 0
+    shown = run(installation, "caller", "app", "inspect.read,fetch,inspect.live")
+    assert shown.stdout.strip() == str(tokens / "app")
+    bad = run(installation, "install", "--no-start", BROWSER_WORKER_CALLER="app;fetch")
+    assert bad.returncode != 0 and "id:capability" in bad.stderr

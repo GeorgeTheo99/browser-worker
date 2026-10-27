@@ -18,10 +18,17 @@ CURRENT_LINK="$DEPLOY_ROOT/current"
 DATA_DIR="${BROWSER_WORKER_DATA_DIR:-$DEPLOY_ROOT/shared}"
 PORT="${BROWSER_WORKER_PORT:-8890}"
 INSTALLED_PORT="$PORT"
-LABEL="com.local.mcp-$SERVICE"
+# An app that installs its own worker (Myai) gives it its own label.
+LABEL="${BROWSER_WORKER_LABEL:-com.local.mcp-$SERVICE}"
+[[ "$LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$ ]] || { printf '✗ BROWSER_WORKER_LABEL is invalid\n' >&2; exit 2; }
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="${BROWSER_WORKER_LOG_DIR:-$HOME/Library/Logs/$SERVICE}"
 CONTAINER="${BROWSER_WORKER_CONTAINER_CLI:-/usr/local/bin/container}"
+VM_NAME="${BROWSER_WORKER_VM_NAME:-browser-worker}"
+# The image's name; its tag is the revision. An app's own VM uses its own, so removing it never removes another's.
+VM_IMAGE_REPO="${BROWSER_WORKER_VM_IMAGE_REPO:-browser-worker-vm}"
+# Source from a release archive (scripts/browser-worker archive) rather than a Git checkout.
+ARCHIVE_SOURCE=0
 PYTHON="$CURRENT_LINK/mcp-browser-worker/.venv/bin/python"
 REVISION=""
 BOOTSTRAP_PYTHON=""
@@ -66,7 +73,7 @@ if path.exists() or path.is_symlink():
             env['BROWSER_WORKER_DEPLOY_ROOT'] = str(binary.parents[4])
     if 'BROWSER_WORKER_LOG_DIR' not in env and isinstance(document.get('StandardOutPath'), str):
         env['BROWSER_WORKER_LOG_DIR'] = str(pathlib.Path(document['StandardOutPath']).parent)
-    for key in ('BROWSER_WORKER_DEPLOY_ROOT','BROWSER_WORKER_DATA_DIR','BROWSER_WORKER_PORT','BROWSER_WORKER_BROWSER_EXECUTABLE','BROWSER_WORKER_LOG_DIR'):
+    for key in ('BROWSER_WORKER_DEPLOY_ROOT','BROWSER_WORKER_DATA_DIR','BROWSER_WORKER_PORT','BROWSER_WORKER_BROWSER_EXECUTABLE','BROWSER_WORKER_LOG_DIR','BROWSER_WORKER_VM_NAME','BROWSER_WORKER_VM_IMAGE_REPO'):
         value=env.get(key)
         if value is not None:
             if not isinstance(value,str) or any(c in value for c in '\r\n\t'):
@@ -81,10 +88,13 @@ PY
       BROWSER_WORKER_PORT) INSTALLED_PORT="$value"; [ "${BROWSER_WORKER_PORT+x}" = x ] || PORT="$value" ;;
       BROWSER_WORKER_BROWSER_EXECUTABLE) [ "${BROWSER_WORKER_BROWSER_EXECUTABLE+x}" = x ] || BROWSER_EXECUTABLE="$value" ;;
       BROWSER_WORKER_LOG_DIR) [ "${BROWSER_WORKER_LOG_DIR+x}" = x ] || LOG_DIR="$value" ;;
+      BROWSER_WORKER_VM_NAME) [ "${BROWSER_WORKER_VM_NAME+x}" = x ] || VM_NAME="$value" ;;
+      BROWSER_WORKER_VM_IMAGE_REPO) [ "${BROWSER_WORKER_VM_IMAGE_REPO+x}" = x ] || VM_IMAGE_REPO="$value" ;;
     esac
   done <<< "$saved"
   [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] \
     || die "BROWSER_WORKER_PORT must be between 1024 and 65535"
+  [[ "$VM_IMAGE_REPO" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || die "BROWSER_WORKER_VM_IMAGE_REPO is invalid"
   local directory
   for directory in "$DEPLOY_ROOT" "$DATA_DIR" "$LOG_DIR"; do
     [[ "$directory" = /* ]] && [ "$directory" != / ] && [ "$directory" != "$HOME" ] \
@@ -110,11 +120,27 @@ ensure_private_dirs() {
 ensure_clients() {
   "$RELEASES_DIR/$REVISION/mcp-browser-worker/.venv/bin/python" \
     "$RELEASES_DIR/$REVISION/mcp-browser-worker/operator_support.py" clients "$DATA_DIR"
+  # An app that installs its own worker (BROWSER_WORKER_CALLER=id:capability,...) owns that caller: it gets
+  # exactly these capabilities, before the worker (which reads its callers when it starts) is activated.
+  if [ -n "${BROWSER_WORKER_CALLER:-}" ]; then
+    [[ "$BROWSER_WORKER_CALLER" =~ ^([a-z0-9][a-z0-9-]{0,63}):([a-z.,]+)$ ]] || die "BROWSER_WORKER_CALLER must be id:capability,..."
+    "$RELEASES_DIR/$REVISION/mcp-browser-worker/.venv/bin/python" \
+      "$RELEASES_DIR/$REVISION/mcp-browser-worker/operator_support.py" caller --replace "$DATA_DIR" \
+      "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >/dev/null
+  fi
 }
 
 source_revision() {
+  if [ ! -e "$ROOT_DIR/.git" ] && [ -f "$ROOT_DIR/.browser-worker-revision" ]; then
+    ARCHIVE_SOURCE=1
+    REVISION="$(tr -d '\r\n' < "$ROOT_DIR/.browser-worker-revision")"
+    printf '%s\n' "$REVISION" | grep -Eq '^[0-9a-f]{40}$' \
+      || die "browser-worker release archive revision is invalid"
+    return 0
+  fi
+  require git
   [ "$(git -C "$ROOT_DIR" rev-parse --show-toplevel 2>/dev/null)" = "$ROOT_DIR" ] \
-    || die "browser-worker source must be a Git checkout"
+    || die "browser-worker source must be a Git checkout or a release archive"
   [ -z "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=all)" ] \
     || die "browser-worker source must be committed and clean before install"
   REVISION="$(git -C "$ROOT_DIR" rev-parse HEAD)"
@@ -175,7 +201,12 @@ prepare_release() {
   if [ ! -d "$release" ]; then
     tmp="$(mktemp -d "$RELEASES_DIR/.release-$REVISION.XXXXXX")"
     preparing_dir="$tmp"
-    git -C "$ROOT_DIR" archive --format=tar "$REVISION" | tar -xf - -C "$tmp"
+    if [ "$ARCHIVE_SOURCE" = 1 ]; then
+      # The unpacked archive is the release; anything a run left beside it stays out.
+      tar -C "$ROOT_DIR" --exclude .venv --exclude __pycache__ --exclude .pytest_cache -cf - . | tar -xf - -C "$tmp"
+    else
+      git -C "$ROOT_DIR" archive --format=tar "$REVISION" | tar -xf - -C "$tmp"
+    fi
     printf '%s\n' "$REVISION" > "$tmp/.browser-worker-revision"
     chmod 600 "$tmp/.browser-worker-revision"
     log "Synchronizing immutable release $REVISION"
@@ -209,7 +240,7 @@ prepare_release() {
   fi
 }
 
-vm_image() { printf 'browser-worker-vm:%s' "$REVISION"; }
+vm_image() { printf '%s:%s' "$VM_IMAGE_REPO" "$REVISION"; }
 
 # The VM's image, built from the sealed release: the worker, Linux Chromium and its virtual display.
 build_vm_image() {
@@ -251,9 +282,9 @@ PY
 }
 
 plist_content() {
-  "$BOOTSTRAP_PYTHON" - "$PLIST" "$LABEL" "$PYTHON" "$CURRENT_LINK" "$DEPLOY_ROOT" "$DATA_DIR" "$REVISION" "$PORT" "$LOG_DIR" "$BROWSER_EXECUTABLE" "$MODE" "$CONTAINER" <<'PY'
-import pathlib, plistlib, sys
-old, label, python, current, deploy, data, revision, port, logs, browser, mode, container = sys.argv[1:]
+  "$BOOTSTRAP_PYTHON" - "$PLIST" "$LABEL" "$PYTHON" "$CURRENT_LINK" "$DEPLOY_ROOT" "$DATA_DIR" "$REVISION" "$PORT" "$LOG_DIR" "$BROWSER_EXECUTABLE" "$MODE" "$CONTAINER" "$(vm_image)" <<'PY'
+import os, pathlib, plistlib, sys
+old, label, python, current, deploy, data, revision, port, logs, browser, mode, container, image = sys.argv[1:]
 env = {}
 if pathlib.Path(old).is_file():
     with open(old, 'rb') as stream: env = plistlib.load(stream).get('EnvironmentVariables', {})
@@ -261,13 +292,21 @@ env.update(BROWSER_WORKER_DATA_DIR=data, BROWSER_WORKER_DEPLOY_ROOT=deploy, BROW
            BROWSER_WORKER_DEPLOY_REVISION=revision, BROWSER_WORKER_PORT=port,
            BROWSER_WORKER_BROWSER_EXECUTABLE=browser, PYTHONDONTWRITEBYTECODE='1', FASTMCP_SHOW_SERVER_BANNER='false')
 program, directory = current+'/mcp-browser-worker/http_server.py', current+'/mcp-browser-worker'
+service = {}
 if mode == 'vm':
-    env.update(BROWSER_WORKER_VM_IMAGE='browser-worker-vm:'+revision, BROWSER_WORKER_CONTAINER_CLI=container)
+    env.update(BROWSER_WORKER_VM_IMAGE=image, BROWSER_WORKER_VM_IMAGE_REPO=image.rpartition(':')[0],
+               BROWSER_WORKER_CONTAINER_CLI=container)
+    # Stopping the VM takes up to 30 s; launchd's default 20 s would leave it running.
+    service['ExitTimeOut'] = 60
+    # The VM's settings, kept from the install that set them.
+    for key in ('BROWSER_WORKER_VM_NAME','BROWSER_WORKER_VM_VOLUME','BROWSER_WORKER_VM_SOCKET','BROWSER_WORKER_VM_CPUS','BROWSER_WORKER_VM_MEMORY','BROWSER_WORKER_VM_IDLE_MINUTES'):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
     program, directory = current+'/vm/host.py', current+'/vm'
 plistlib.dump({'Label':label, 'ProgramArguments':[python, program],
               'WorkingDirectory':directory, 'EnvironmentVariables':env,
               'StandardOutPath':logs+'/browser-worker.log', 'StandardErrorPath':logs+'/browser-worker.log',
-              'KeepAlive':True, 'RunAtLoad':True, 'ThrottleInterval':5, 'Umask':63}, sys.stdout.buffer)
+              'KeepAlive':True, 'RunAtLoad':True, 'ThrottleInterval':5, 'Umask':63, **service}, sys.stdout.buffer)
 PY
 }
 
@@ -368,7 +407,7 @@ install_cmd() {
   previous_port="$INSTALLED_PORT"; preparing_dir=""
   case "${1:-}" in '') ;; --no-start) no_start=1; shift ;; *) die "usage: install [--no-start]" ;; esac
   [ $# -eq 0 ] || die "usage: install [--no-start]"
-  require uv; require git; require curl; require launchctl; require plutil; require tar; require lsof
+  require uv; require curl; require launchctl; require plutil; require tar; require lsof
   [ "$MODE" != vm ] || [ -x "$CONTAINER" ] || die "Apple container CLI is unavailable at $CONTAINER"
   source_revision
   ensure_private_dirs
@@ -405,12 +444,12 @@ install_cmd() {
 status() {
   launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state/ {print "launchd: "$2; found=1; exit} END{if(!found) print "launchd: not-loaded"}'
   curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null || true; printf '\n'
-  [ "$MODE" != vm ] || "$CONTAINER" ls --all 2>/dev/null | awk 'NR == 1 || $1 == "browser-worker"'
+  [ "$MODE" != vm ] || "$CONTAINER" ls --all 2>/dev/null | awk -v name="$VM_NAME" 'NR == 1 || $1 == name'
 }
 
 case "${1:-}" in
-  install) require git; source_revision; bootstrap_python; load_installed_paths ;;
-  start|restart|verify|status|env|check|logs) bootstrap_python; load_installed_paths ;;
+  install) source_revision; bootstrap_python; load_installed_paths ;;
+  start|restart|verify|status|env|check|logs|caller) bootstrap_python; load_installed_paths ;;
 esac
 
 case "${1:-}" in
@@ -429,6 +468,22 @@ case "${1:-}" in
     fi
     printf 'ROOT_DIR=%s\nDEPLOY_ROOT=%s\nCURRENT_LINK=%s\nDATA_DIR=%s\nPORT=%s\nLABEL=%s\nLOG_DIR=%s\nPRODUCTION_TOKEN_FILE=%s\n' "$ROOT_DIR" "$DEPLOY_ROOT" "$CURRENT_LINK" "$DATA_DIR" "$PORT" "$LABEL" "$LOG_DIR" "$production_token"
     ;;
+  # A caller with exactly these capabilities, for an app that installs its own worker; prints its token file.
+  # The worker reads its callers when it starts.
+  caller)
+    [ $# -eq 3 ] || die "usage: caller ID CAPABILITY[,CAPABILITY...]"
+    [ -x "$PYTHON" ] || die "run install first"
+    "$PYTHON" "$CURRENT_LINK/mcp-browser-worker/operator_support.py" caller "$DATA_DIR" "$2" "$3"
+    ;;
+  # A release archive of the committed HEAD that installs without Git (install.sh from its unpacked copy).
+  archive)
+    [ $# -eq 2 ] || die "usage: archive OUTPUT.tar"
+    require git
+    source_revision
+    [ "$ARCHIVE_SOURCE" = 0 ] || die "archive needs the Git checkout"
+    git -C "$ROOT_DIR" archive --format=tar --add-virtual-file=".browser-worker-revision:$REVISION"$'\n' -o "$2" "$REVISION"
+    ok "archive of $REVISION: $2"
+    ;;
   uninstall) bootout; rm -f "$PLIST"; ok "uninstalled; private data retained" ;;
-  *) echo "usage: $0 {install [--no-start]|start|stop|restart|verify|status|logs|check|env|uninstall}" >&2; exit 2 ;;
+  *) echo "usage: $0 {install [--no-start]|start|stop|restart|verify|status|logs|check|env|caller|archive|uninstall}" >&2; exit 2 ;;
 esac

@@ -193,3 +193,50 @@ def test_verify_fails_on_wrong_service_or_authentication(
 async def test_browser_render_check_launches_real_browser(capsys):
     await operator.browser_check(render=True)
     assert "Browser launch/render verified" in capsys.readouterr().out
+
+
+MYAI = ["fetch", "inspect.live", "inspect.read"]
+
+
+def test_caller_is_added_once_with_exactly_its_capabilities(tmp_path, capsys):
+    operator.ensure_clients(tmp_path)
+    token = operator.ensure_caller(tmp_path, "myai", MYAI)
+    assert token == tmp_path / "tokens/myai"
+    before = token.read_bytes()
+    assert stat.S_IMODE(token.stat().st_mode) == 0o600
+    assert operator.ensure_caller(tmp_path, "myai", list(reversed(MYAI))) == token
+    assert token.read_bytes() == before
+    rows = {row["id"]: row for row in json.loads((tmp_path / "clients.json").read_text())["clients"]}
+    assert rows["myai"]["capabilities"] == MYAI
+    assert set(rows) == {"pi-production", "myai"}
+    assert before.decode().strip() not in capsys.readouterr().out
+    ClientRegistry(tmp_path / "clients.json", tmp_path).load()
+
+
+def test_caller_with_other_capabilities_is_not_changed(tmp_path):
+    existing_config(tmp_path, client_id="myai", token_file="tokens/myai")
+    before = (tmp_path / "clients.json").read_bytes()
+    with pytest.raises(ValueError, match="other capabilities"):
+        operator.ensure_caller(tmp_path, "myai", MYAI)
+    assert (tmp_path / "clients.json").read_bytes() == before
+
+
+def test_caller_with_an_unknown_capability_is_refused(tmp_path):
+    with pytest.raises(AuthConfigError):
+        operator.ensure_caller(tmp_path, "myai", ["fetch", "everything"])
+    assert not (tmp_path / "clients.json").exists()
+    assert not (tmp_path / "tokens/myai").exists()
+
+
+def test_an_apps_install_replaces_its_callers_capabilities_and_keeps_its_token(tmp_path):
+    token = operator.ensure_caller(tmp_path, "myai", MYAI)
+    before = token.read_bytes()
+    wider = [*MYAI, "inspect.upload"]
+    assert operator.ensure_caller(tmp_path, "myai", wider, replace=True) == token
+    assert token.read_bytes() == before
+    rows = {row["id"]: row for row in json.loads((tmp_path / "clients.json").read_text())["clients"]}
+    assert rows["myai"]["capabilities"] == wider
+    ClientRegistry(tmp_path / "clients.json", tmp_path).load()
+    with pytest.raises(AuthConfigError):
+        operator.ensure_caller(tmp_path, "myai", ["everything"], replace=True)
+    assert json.loads((tmp_path / "clients.json").read_text())["clients"][0]["capabilities"] == wider

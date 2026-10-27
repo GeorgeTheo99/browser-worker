@@ -66,26 +66,28 @@ def production_client(data: Path):
     return config, row, registry
 
 
-def ensure_clients(data: Path) -> None:
+def _load_clients(data: Path):
+    """The client registry and its document, validated before anything changes; empty when there is none."""
     from auth import ClientRegistry
 
     private_dir(data)
     private_dir(data / "tokens")
     config_path = data / "clients.json"
-    config = {"version": 1, "clients": []}
-    registry = None
-    if config_path.exists() or config_path.is_symlink():
-        registry = ClientRegistry(config_path, data)
-        registry.load()  # Validate before modifying anything; never repair unsafe input silently.
-        config = json.loads(config_path.read_text())
-        if any(row["id"] == "pi-production" for row in config["clients"]):
-            production_client(data)
-            print("Existing pi-production caller and token preserved")
-            return
-    relative = "tokens/pi-production"
+    if not config_path.exists() and not config_path.is_symlink():
+        return {"version": 1, "clients": []}, None
+    registry = ClientRegistry(config_path, data)
+    registry.load()  # Validate before modifying anything; never repair unsafe input silently.
+    return json.loads(config_path.read_text()), registry
+
+
+def _add_caller(data: Path, config, registry, caller_id: str, capabilities: list[str]) -> Path:
+    """Add a caller with a new private token at tokens/<id>; return the token file."""
+    from auth import ClientRegistry
+
+    relative = f"tokens/{caller_id}"
     if any(row["token_file"] == relative for row in config["clients"]):
         raise ValueError(
-            "production token path is assigned to another caller; review clients.json"
+            f"{caller_id} token path is assigned to another caller; review clients.json"
         )
     token_path = data / relative
     created = False
@@ -94,7 +96,7 @@ def ensure_clients(data: Path) -> None:
         value = token_path.read_text().strip()
         if registry and registry.authenticate_header("Bearer " + value):
             raise ValueError(
-                "production token would reuse another caller's credential; review it explicitly"
+                f"{caller_id} token would reuse another caller's credential; review it explicitly"
             )
     else:
         value = secrets.token_urlsafe(48)
@@ -103,7 +105,7 @@ def ensure_clients(data: Path) -> None:
             stream.write(value + "\n")
         created = True
     config["clients"].append(
-        {"id": "pi-production", "token_file": relative, "capabilities": PI_CAPABILITIES}
+        {"id": caller_id, "token_file": relative, "capabilities": capabilities}
     )
     fd, temporary = tempfile.mkstemp(prefix=".clients-", dir=data)
     try:
@@ -112,14 +114,55 @@ def ensure_clients(data: Path) -> None:
             stream.write("\n")
         # Uses the service's actual validation, including token uniqueness and modes.
         ClientRegistry(Path(temporary), data).load()
-        os.replace(temporary, config_path)
+        os.replace(temporary, data / "clients.json")
     except BaseException:
         if created:
             token_path.unlink(missing_ok=True)
         raise
     finally:
         Path(temporary).unlink(missing_ok=True)
+    return token_path
+
+
+def ensure_clients(data: Path) -> None:
+    config, registry = _load_clients(data)
+    if any(row["id"] == "pi-production" for row in config["clients"]):
+        production_client(data)
+        print("Existing pi-production caller and token preserved")
+        return
+    _add_caller(data, config, registry, "pi-production", PI_CAPABILITIES)
     print("Local pi-production caller provisioned; no external API key required")
+
+
+def ensure_caller(
+    data: Path, caller_id: str, capabilities: list[str], *, replace: bool = False
+) -> Path:
+    """A caller with exactly these capabilities (an app that installs its own worker); return its token file.
+
+    An existing one with other capabilities is refused, since changing a caller's grants is the operator's
+    call, unless `replace`: an app's install owns its caller, and keeps its token."""
+    config, registry = _load_clients(data)
+    row = next((row for row in config["clients"] if row["id"] == caller_id), None)
+    if row is None:
+        return _add_caller(data, config, registry, caller_id, capabilities)
+    if sorted(row["capabilities"]) != sorted(capabilities):
+        if not replace:
+            raise ValueError(
+                f"existing {caller_id} caller has other capabilities; review its policy explicitly"
+            )
+        from auth import ClientRegistry
+
+        row["capabilities"] = capabilities
+        fd, temporary = tempfile.mkstemp(prefix=".clients-", dir=data)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(config, stream, indent=2)
+                stream.write("\n")
+            ClientRegistry(Path(temporary), data).load()
+            os.replace(temporary, data / "clients.json")
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+    return data / row["token_file"]
 
 
 async def browser_check(render: bool) -> None:
@@ -297,6 +340,11 @@ def main() -> int:
     p.add_argument("port", type=int)
     p.add_argument("revision")
     p.add_argument("--smoke", action="store_true")
+    p = commands.add_parser("caller")
+    p.add_argument("--replace", action="store_true")
+    p.add_argument("data", type=Path)
+    p.add_argument("id")
+    p.add_argument("capabilities")
     p = commands.add_parser("token-path")
     p.add_argument("data", type=Path)
     args = parser.parse_args()
@@ -315,6 +363,15 @@ def main() -> int:
             if not 1024 <= args.port <= 65535:
                 raise ValueError("invalid browser-worker port")
             verify(args.data, args.port, args.revision, args.smoke)
+        elif args.command == "caller":
+            print(
+                ensure_caller(
+                    args.data,
+                    args.id,
+                    sorted(set(args.capabilities.split(","))),
+                    replace=args.replace,
+                )
+            )
         elif args.command == "token-path":
             _, row, _ = production_client(args.data)
             print(args.data / row["token_file"])

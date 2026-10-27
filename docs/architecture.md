@@ -35,8 +35,15 @@ to run beside the host install.
   a pinned Python base, the locked environment, Patchright's Linux Chromium, Xvfb, Mesa, PulseAudio and
   fonts. The installer's browser check runs inside it.
 - **VM.** launchd runs `vm/host.py`, which runs the VM `browser-worker` (7 CPUs, which the guest sees as 8;
-  6 GiB; a 1 GiB `/dev/shm`) and stops it when the service stops. Sessions, durable profiles and artifacts
-  live on the volume `browser-worker-data`. The Mac's data directory, which keeps `clients.json` and the
+  6 GiB; a 1 GiB `/dev/shm`). The VM starts on the first connection (a caller's first request waits until
+  the worker in it answers `/live`) and stops after `BROWSER_WORKER_VM_IDLE_MINUTES` (30; `0` keeps it
+  running) with no connection open, which gives its memory back to the Mac, and when the service stops
+  (`ExitTimeOut` 60 s, so launchd waits for that). While it's stopped, `host.py` answers `/health` itself
+  (`"vm": "stopped"`, behind the same loopback Host and Origin check as the worker), so a health check
+  doesn't start it; `/live` does, which gives the installer's liveness wait to a starting VM. A VM left by a
+  killed host is removed when the host starts. Sessions, durable profiles and
+  artifacts live on the volume `browser-worker-data`; an idle stop ends open sessions, as their own idle
+  limits would. The Mac's data directory, which keeps `clients.json` and the
   tokens its callers read, is mounted read-only and copied in at start. The VM gets the Mac's time zone.
 - **Serving.** The worker listens on a Unix socket that the VM publishes to the Mac
   (`<data>/run/worker.sock`), and `host.py` forwards `127.0.0.1:<port>` to it, so callers are unchanged. A
@@ -52,6 +59,31 @@ to run beside the host install.
 - **Limits.** Saved sign-ins don't carry over from the host install (Chrome encrypts cookies per OS), so
   durable profiles start empty. The time zone is read when the VM starts. Memory the VM frees stays held
   until it stops.
+- **Settings.** `BROWSER_WORKER_VM_NAME`, `_VOLUME`, `_IMAGE_REPO` (the image's name; its tag is the
+  revision), `_SOCKET` (the published socket, for a data path near macOS's 104-byte socket path limit),
+  `_CPUS`, `_MEMORY` and `_IDLE_MINUTES`, set at install, are kept in the service's plist, so an app's own VM
+  never shares this one's name, volume or image.
+
+## Installs by an app
+
+An app that ships browser-worker (Myai) installs it from a release archive, without Git, under its own
+label and paths, and adds its own caller:
+
+```bash
+scripts/browser-worker archive browser-worker.tar      # in the checkout: the committed HEAD
+# on the user's Mac, from the unpacked archive:
+BROWSER_WORKER_LABEL=com.example.app.browser BROWSER_WORKER_DEPLOY_ROOT=… BROWSER_WORKER_DATA_DIR=… \
+  BROWSER_WORKER_LOG_DIR=… BROWSER_WORKER_PORT=… BROWSER_WORKER_CALLER=app:fetch,inspect.read \
+  scripts/browser-worker install
+scripts/browser-worker caller app fetch,inspect.read   # prints the caller's token file
+```
+
+The archive holds `.browser-worker-revision`, which an install takes as the release's revision.
+`BROWSER_WORKER_CALLER` gives the app's caller exactly those capabilities before the worker is activated
+(it reads its callers when it starts), keeping its token; an install that fails restores the previous
+release as any install does. `caller` adds a caller with exactly those capabilities, or keeps one that has
+exactly them, and prints its token file; one with other capabilities is refused, since changing a
+caller's grants is the operator's call.
 
 ## Tool contracts
 
