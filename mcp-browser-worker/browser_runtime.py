@@ -1777,7 +1777,9 @@ class BrowserManager:
                                 await element.dispose()
                         record = await self.artifacts.create(owner, data, suffix="png", mime_type="image/png", max_bytes=MAX_SCREENSHOT_BYTES)
                         return {"status": "ok", "session_id": session.id, "artifact": record.public()}
-                    await self._ensure_capture_bounds(page)
+                    # Only a full-page capture grows with the page; the visible area is always the viewport.
+                    if full_page:
+                        await self._ensure_capture_bounds(page)
                     capture_id = None
                     try:
                         if params.get("track") and not full_page:

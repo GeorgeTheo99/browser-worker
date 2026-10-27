@@ -343,6 +343,28 @@ async def test_windowed_browser_moves_its_window_into_the_corner(tmp_path: Path)
 
 @pytest.mark.browser
 @pytest.mark.asyncio
+async def test_visible_screenshot_of_a_page_too_tall_for_a_full_one(tmp_path: Path) -> None:
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    await artifacts.start()
+    manager = BrowserManager(artifacts, sessions_dir=tmp_path / "sessions")
+    await manager.start()
+    try:
+        opened = await manager.open("owner", None, wait_until="domcontentloaded", timeout_ms=15_000)
+        session_id = str(opened["session_id"])
+        session = await manager._get("owner", session_id)
+        # Taller than a full-page capture allows (a long Wikipedia article, say).
+        await manager._active_page(session).evaluate("() => { document.body.style.height = '60000px'; }")
+        visible = await manager.act("owner", session_id, "screenshot", full_page=False)
+        assert (await artifacts.read("owner", visible["artifact"]["artifact_id"]))[1].startswith(b"\x89PNG")
+        with pytest.raises(WorkerError, match="too large"):
+            await manager.act("owner", session_id, "screenshot", full_page=True)
+    finally:
+        await manager.shutdown()
+        await artifacts.close()
+
+
+@pytest.mark.browser
+@pytest.mark.asyncio
 async def test_browser_launches_muted(tmp_path: Path) -> None:
     artifacts = ArtifactStore(tmp_path / "artifacts")
     await artifacts.start()
