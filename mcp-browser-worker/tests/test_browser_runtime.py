@@ -341,6 +341,26 @@ async def test_windowed_browser_moves_its_window_into_the_corner(tmp_path: Path)
         await artifacts.close()
 
 
+@pytest.mark.browser
+@pytest.mark.asyncio
+async def test_browser_launches_muted(tmp_path: Path) -> None:
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    await artifacts.start()
+    manager = BrowserManager(artifacts, sessions_dir=tmp_path / "sessions")
+    await manager.start()
+    try:
+        opened = await manager.open("owner", None, wait_until="domcontentloaded", timeout_ms=15_000)
+        assert opened["session_id"]
+        ps = await asyncio.create_subprocess_exec("ps", "-ax", "-o", "command=", stdout=asyncio.subprocess.PIPE)
+        commands = (await ps.communicate())[0].decode().splitlines()
+        # The browser process, found by its profile under this test's sessions dir.
+        browser = [line for line in commands if f"--user-data-dir={tmp_path / 'sessions'}" in line and "--type=" not in line]
+        assert browser and all("--mute-audio" in line for line in browser)
+    finally:
+        await manager.shutdown()
+        await artifacts.close()
+
+
 def test_regular_user_agent_names_chrome_not_headless_chrome(tmp_path: Path) -> None:
     contents = tmp_path / "Chromium.app" / "Contents"
     (contents / "MacOS").mkdir(parents=True)

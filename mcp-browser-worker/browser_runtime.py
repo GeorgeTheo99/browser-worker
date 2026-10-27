@@ -505,6 +505,8 @@ class BrowserManager:
         args = chromium_hardening_args()
         # Bound the on-disk cache that durable profiles would otherwise accumulate.
         args.append("--disk-cache-size=104857600")
+        # The browser runs on the host Mac, and the live view is video only: keep pages' sound off the speakers.
+        args.append("--mute-audio")
         options: dict[str, Any] = {
             "headless": HEADLESS,
             "accept_downloads": downloads_dir is not None,
