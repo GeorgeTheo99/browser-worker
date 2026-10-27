@@ -20,7 +20,13 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from approvals import MAX_ARG_BYTES
 from artifacts import ArtifactError, ArtifactStore
 from auth import Caller, ClientRegistry, current_caller
-from browser_runtime import MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES, BrowserManager, WorkerError, safe_download_name
+from browser_runtime import (
+    MAX_UPLOAD_BYTES,
+    MAX_UPLOAD_FILES,
+    BrowserManager,
+    WorkerError,
+    safe_download_name,
+)
 from config import (
     ARTIFACTS_DIR,
     CLIENTS_CONFIG,
