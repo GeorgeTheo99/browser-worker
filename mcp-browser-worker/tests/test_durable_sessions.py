@@ -177,6 +177,8 @@ def test_download_names_are_sanitized() -> None:
         ({"type": "text", "text": "hello"}, {"type": "text", "text": "hello"}),
         ({"type": "navigate", "url": "https://example.com/"}, {"type": "navigate", "url": "https://example.com/"}),
         ({"type": "back"}, {"type": "back"}),
+        ({"type": "viewport", "width": 390, "height": 600}, {"type": "viewport", "width": 390, "height": 600}),
+        ({"type": "viewport"}, {"type": "viewport"}),
     ],
 )
 def test_live_input_accepts_bounded_events(body: dict[str, Any], expected: dict[str, Any]) -> None:
@@ -200,6 +202,11 @@ def test_live_input_accepts_bounded_events(body: dict[str, Any], expected: dict[
         {"type": "navigate", "url": "http://127.0.0.1/"},
         {"type": "navigate", "url": "file:///etc/passwd"},
         {"type": "evaluate"},
+        {"type": "viewport", "width": 390},
+        {"type": "viewport", "width": 200, "height": 600},
+        {"type": "viewport", "width": 390, "height": 99_999},
+        {"type": "viewport", "width": 390.5, "height": 600},
+        {"type": "viewport", "width": True, "height": 600},
     ],
 )
 def test_live_input_rejects_invalid_events(body: Any) -> None:
@@ -323,7 +330,31 @@ async def test_durable_profile_downloads_and_live_takeover(
         await manager.human_input("owner", session_id, {"type": "up", "x": 220.0, "y": 320.0, "button": "left"})
         held = await manager.act("owner", session_id, "evaluate", script="document.querySelector('#h').dataset.up")
         assert held["result"] == "220:20"
+
+        # A person on a phone gets the page laid out for their screen, and the frames say so.
+        size = "[innerWidth, innerHeight]"
+        await manager.human_input("owner", session_id, {"type": "viewport", "width": 390, "height": 600})
+        async with asyncio.timeout(15):
+            while True:
+                event = await anext(events)
+                if event["event"] == "frame" and event["width"] == 390:
+                    break
+        assert event["height"] == 600
+        # The agent always acts at its own size, whatever the person asked for.
+        assert (await manager.act("owner", session_id, "evaluate", script=size))["result"] == [
+            browser_runtime.VIEWPORT_WIDTH, browser_runtime.VIEWPORT_HEIGHT,
+        ]
+        await manager.human_input("owner", session_id, {"type": "viewport", "width": 390, "height": 600})
+        await manager.human_input("owner", session_id, {"type": "viewport"})
+        assert (await manager.act("owner", session_id, "evaluate", script=size))["result"][0] == browser_runtime.VIEWPORT_WIDTH
+        # Leaving without handing the size back (the phone closed the view) restores it too.
+        await manager.human_input("owner", session_id, {"type": "viewport", "width": 390, "height": 600})
         await events.aclose()
+        session = manager._sessions[session_id]
+        assert session.human_viewport is None
+        assert manager._active_page(session).viewport_size == {
+            "width": browser_runtime.VIEWPORT_WIDTH, "height": browser_runtime.VIEWPORT_HEIGHT,
+        }
 
         await manager.act("owner", session_id, "click", selector="#dl")
         async with asyncio.timeout(15):

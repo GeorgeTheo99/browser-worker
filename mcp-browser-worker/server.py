@@ -656,6 +656,8 @@ def parse_live_input(body: Any) -> dict[str, Any]:
         "back": {"type"},
         "forward": {"type"},
         "reload": {"type"},
+        # A person on a phone asks for a page laid out for their screen; without a size, the worker's own.
+        "viewport": {"type", "width", "height"},
     }
     if kind not in fields or not set(body) <= fields[kind]:
         raise WorkerError("input event is invalid", code="invalid_request")
@@ -686,6 +688,15 @@ def parse_live_input(body: Any) -> dict[str, Any]:
         if not isinstance(text, str) or not 1 <= len(text) <= 2000:
             raise WorkerError("text is invalid", code="invalid_request")
         event["text"] = text
+    elif kind == "viewport":
+        if "width" in body or "height" in body:
+            width, height = body.get("width"), body.get("height")
+            if (
+                not isinstance(width, int) or isinstance(width, bool) or not 320 <= width <= VIEWPORT_WIDTH
+                or not isinstance(height, int) or isinstance(height, bool) or not 240 <= height <= VIEWPORT_HEIGHT
+            ):
+                raise WorkerError("viewport is invalid", code="invalid_request")
+            event.update(width=width, height=height)
     elif kind == "navigate":
         url = body.get("url")
         try:

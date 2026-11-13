@@ -369,6 +369,9 @@ class BrowserSession:
     downloads: list[dict[str, object]] = field(default_factory=list)
     tasks: set[asyncio.Task[None]] = field(default_factory=set)
     live: LiveView = field(default_factory=LiveView)
+    # A smaller viewport a person watching on a phone asked for while they control the page, so the site lays
+    # itself out for that width; None is the worker's own size. The agent always gets its own size back.
+    human_viewport: tuple[int, int] | None = None
     # Every short element reference `elements` gave, oldest first, each bound to its exact element; only
     # those the latest listing gave can be acted on.
     refs: dict[str, ElementHandle] = field(default_factory=dict)
@@ -1160,6 +1163,14 @@ class BrowserManager:
                 # Watching counts as activity so a supervised session does not idle out.
                 session.touched_mono = time.monotonic()
                 try:
+                    if session.human_viewport is not None and not session.lock.locked():
+                        # A tab the person switched to (or one the page opened) gets their size too. An unheld
+                        # lock is taken without waiting; a held one means the agent is acting, at its own size.
+                        await session.lock.acquire()
+                        try:
+                            await self._fit_human_viewport(session, page)
+                        finally:
+                            session.lock.release()
                     await live.follow(page)
                 except Exception as exc:  # noqa: BLE001 - a closing tab is followed by the next one
                     logger.debug("live view follow ended: %s", type(exc).__name__)
@@ -1193,6 +1204,7 @@ class BrowserManager:
             live.viewers -= 1
             if live.viewers == 0:
                 await asyncio.shield(live.stop())
+                await asyncio.shield(self._release_human_viewport(session))
 
     async def human_input(self, owner: str, session_id: str, event: dict[str, Any]) -> dict[str, object]:
         """Apply one validated input event from a person supervising the live view."""
@@ -1237,6 +1249,13 @@ class BrowserManager:
                     elif kind in {"back", "forward", "reload"}:
                         move = {"back": page.go_back, "forward": page.go_forward, "reload": page.reload}[kind]
                         await move(wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+                    elif kind == "viewport":
+                        size = (event["width"], event["height"]) if "width" in event else None
+                        session.human_viewport = size
+                        if size is None:
+                            await self._restore_viewports(session)
+                        else:
+                            await self._fit_human_viewport(session, page)
                     else:
                         raise fail("invalid_request")
                 except WorkerError:
@@ -1370,6 +1389,47 @@ class BrowserManager:
     def _pages(session: BrowserSession) -> list[Page]:
         return [page for page in session.context.pages if not page.is_closed()]
 
+    async def _fit_human_viewport(self, session: BrowserSession, page: Page) -> None:
+        """Give the page the person's viewport, if they asked for one and it doesn't have it."""
+        size = session.human_viewport
+        if size is not None and page.viewport_size != {"width": size[0], "height": size[1]}:
+            await page.set_viewport_size({"width": size[0], "height": size[1]})
+            await session.live.restart()
+
+    async def _restore_viewports(self, session: BrowserSession) -> None:
+        """Every tab back at the worker's own size (the caller holds the session lock or owns the session)."""
+        session.human_viewport = None
+        default = {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}
+        resized = False
+        for page in self._pages(session):
+            if page.viewport_size != default:
+                try:
+                    await page.set_viewport_size(default)
+                    resized = True
+                except Exception as exc:  # noqa: BLE001 - a closing tab needs no size
+                    logger.debug("viewport restore ended: %s", type(exc).__name__)
+        if resized:
+            await session.live.restart()
+        session.live.wake()
+
+    async def _agent_viewport(self, session: BrowserSession) -> None:
+        """The agent's references, coordinates and screenshots assume the worker's own size: restore it."""
+        if session.human_viewport is not None:
+            await self._restore_viewports(session)
+
+    async def _release_human_viewport(self, session: BrowserSession) -> None:
+        """The last viewer left: a phone-sized page must not outlive the person who asked for it."""
+        if session.human_viewport is None or session.disposed:
+            return
+        try:
+            async with asyncio.timeout(10):
+                async with session.lock:
+                    if not session.disposed:
+                        await self._restore_viewports(session)
+        except TimeoutError:
+            # The agent holds the page; its own next action restores the size.
+            pass
+
     def _active_page(self, session: BrowserSession) -> Page:
         pages = self._pages(session)
         if not pages:
@@ -1410,6 +1470,7 @@ class BrowserManager:
         async with self.operation():
             session = await self._get(owner, session_id)
             async with session.lock:
+                await self._agent_viewport(session)
                 await self._navigate(session, url, wait_until=wait_until, timeout_ms=timeout_ms)
                 return await self._state(session)
 
@@ -1521,6 +1582,7 @@ class BrowserManager:
             session = await self._get(owner, session_id)
             async with session.lock:
                 session.touched_mono = time.monotonic()
+                await self._agent_viewport(session)
                 page = self._active_page(session)
                 timeout_ms = int(params.get("timeout_ms") or DEFAULT_TIMEOUT_MS)
                 frame = page.main_frame

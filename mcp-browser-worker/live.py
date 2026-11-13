@@ -89,6 +89,18 @@ class LiveView:
         except Exception as exc:  # noqa: BLE001 - the tab or browser may already be gone
             logger.debug("screencast stop ended: %s", type(exc).__name__)
 
+    async def restart(self) -> None:
+        """Start the screencast again, so the next frame shows a resized page.
+
+        A page that doesn't change paints no frame after a resize, and a viewer would go on mapping its
+        taps onto the old size.
+        """
+        async with self._lock:
+            page = self._page
+            await self._stop_locked()
+        if page is not None and not page.is_closed():
+            await self.follow(page)
+
     async def stop(self) -> None:
         async with self._lock:
             await self._stop_locked()

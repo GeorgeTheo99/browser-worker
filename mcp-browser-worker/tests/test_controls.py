@@ -345,6 +345,7 @@ async def test_safe_exception_boundary_and_extraction_timeout(monkeypatch):
     class Session:
         lock = asyncio.Lock()
         touched_mono = 0
+        human_viewport = None
 
     manager = BrowserManager(None)
     async def get(*_args):
