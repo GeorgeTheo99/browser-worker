@@ -319,7 +319,15 @@ write_plist() {
   mv -f "$tmp" "$PLIST"
 }
 
-bootout() { launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true; }
+# launchd keeps a job it is stopping (up to its 60 s ExitTimeOut, while the worker closes its connections) and
+# refuses to bootstrap it again meanwhile: wait until it is gone.
+bootout() {
+  local target="gui/$(id -u)/$LABEL" i=0
+  launchctl bootout "$target" >/dev/null 2>&1 || true
+  while [ "$i" -lt 70 ] && launchctl print "$target" >/dev/null 2>&1; do
+    sleep 1; i=$((i+1))
+  done
+}
 wait_port_free() {
   local i=0
   while [ "$i" -lt 30 ]; do
