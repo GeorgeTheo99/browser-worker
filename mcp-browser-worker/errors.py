@@ -23,6 +23,10 @@ ERROR_MESSAGES = {
     "point_outside": "that point is outside the visible page",
     "point_in_frame": "that point is inside an embedded frame; use frames and frame_id",
     "stale_capture": "that point no longer shows what the screenshot did (something moved, scrolled, or was replaced); take a new one",
+    "native_select": "that is a dropdown list (a select): choose its option with select_option, its ref, and one of the options elements lists for it",
+    "not_a_select": "select_option by ref is for a dropdown list (a select); click a custom dropdown, then click its option",
+    "unknown_option": "that dropdown list has no option with exactly that label; elements lists its options",
+    "stale_picker": "that dropdown list changed or is gone; open it again",
 }
 
 

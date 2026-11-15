@@ -19,6 +19,7 @@ from patchright.async_api import TimeoutError as BrowserTimeoutError
 from controls import check_access
 from errors import fail
 from frames import DocumentRef, ancestry, check_frame_access
+from pickers import popup_select
 from security import NetworkPolicyError, parse_public_url
 
 APPROVAL_TTL_SECONDS = 120
@@ -163,6 +164,23 @@ _ELEMENTS = r"""args => {
     for (const el of [root, ...root.querySelectorAll(query)])
       if (!seen.has(el) && el.matches(query)) { seen.add(el); candidates.push(el); }
   const needle = (args.text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  // A dropdown list's options are chosen with select_option, not clicked: its row lists them (a list Chromium
+  // draws outside the page can't be clicked), and words of an option find it.
+  const choices = (el, needle) => {
+    if (el.localName !== 'select' || el.multiple) return null;
+    const all = [...el.options], enabled = [];
+    for (const o of all) {
+      const group = o.parentElement?.localName === 'optgroup' ? o.parentElement : null;
+      const label = (o.label || o.text || '').replace(/\s+/g, ' ').trim();
+      if (label && label.length <= 200 && !o.disabled && !group?.disabled) enabled.push(label);
+    }
+    const chosen = all[el.selectedIndex];
+    // A long list (countries, states) shows the options the filter's words are in, or else its first 50.
+    const matching = needle ? enabled.filter(o => o.toLowerCase().includes(needle)) : [];
+    const shown = matching.length ? matching : enabled;
+    return {options: shown.slice(0, 50), truncated: shown.length < enabled.length || shown.length > 50,
+      selected: chosen ? (chosen.label || chosen.text || '').replace(/\s+/g, ' ').trim().slice(0, 200) : ''};
+  };
   const chrome = 'header,nav,footer,[role="banner"],[role="navigation"],[role="contentinfo"]';
   const found = [], twins = new Map();
   let scanned = 0, skipped = false;
@@ -184,7 +202,7 @@ _ELEMENTS = r"""args => {
     const key = own.toLowerCase().replace(/\s+/g, ' ').trim();
     if (!twins.has(key)) twins.set(key, []);
     twins.get(key).push(el);
-    found.push({el, own, key, selector});
+    found.push({el, own, key, selector, choices: choices(el, needle)});
   }
   // Like text(), never inside a field or editable content, but with its pieces apart ("Sealer" "Delete").
   const words = el => {
@@ -213,18 +231,21 @@ _ELEMENTS = r"""args => {
   for (const row of found) {
     const same = twins.get(row.key);
     row.around = same.length > 1 ? near(row.el, same) : '';
-    if (needle && !row.key.includes(needle) && !row.around.toLowerCase().includes(needle)) continue;
+    if (needle && !row.key.includes(needle) && !row.around.toLowerCase().includes(needle) &&
+        !row.choices?.options.some(o => o.toLowerCase().includes(needle))) continue;
     // Page furniture (site header, menus, footer) goes after the page's own content.
     (row.el.closest(chrome) ? aside : main).push(row);
   }
   const kept = [...main, ...aside];
   const limit = Math.min(args.limit, kept.length);
   const rows = [], els = [];
-  for (const {el, own, around, selector} of kept.slice(0, limit)) {
+  for (const {el, own, around, selector, choices} of kept.slice(0, limit)) {
     rows.push({selector, tag: el.tagName.toLowerCase(), role: (el.getAttribute('role') || '').slice(0,100),
       label: own, type: (el.getAttribute('type') || '').slice(0,100),
       href: (el.matches('a[href]') ? el.href : '').slice(0,8192),
-      ...(around && around !== own ? {near: around} : {})});
+      ...(around && around !== own ? {near: around} : {}),
+      ...(choices ? {options: choices.options, selected: choices.selected,
+        ...(choices.truncated ? {options_truncated: true} : {})} : {})});
     els.push(el);
   }
   return {rows, els, truncated: skipped || kept.length > limit};
@@ -370,6 +391,9 @@ class ApprovalStore:
                         raise fail('selector_not_found')
                     if await proposal.element.owner_frame() != frame:
                         raise fail('approval_unavailable')
+                    if await popup_select(proposal.element):
+                        # Its list would open outside the page, where nobody can use it (pickers.py).
+                        raise fail('native_select')
                     proposal.snapshot = await proposal.element.evaluate_handle(r"""(el, args) => {
                       const inspect = """ + _SNAPSHOT + r""";
                       const saved = inspect(el, args.command);

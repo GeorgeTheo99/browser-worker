@@ -92,6 +92,9 @@ async def test_discovery_and_prepare_are_readonly_exact_execution_once(approved)
     first, duplicate = await asyncio.gather(execute(sid, click), execute(sid, click))
     assert sorted([first.get('status'), duplicate.get('status')]) == ['error', 'ok']
     assert await page.evaluate('window.clicks') == 1
+    # A dropdown list's own list opens outside the page, where nobody could use it: refused up front.
+    await page.evaluate("document.body.insertAdjacentHTML('beforeend', '<select id=plan><option>A</option></select>')")
+    assert (await call(sid, 'prepare_action', operation='click', selector='#plan'))['code'] == 'native_select'
 
 
 async def test_typing_can_update_unrelated_validation_text_before_approved_submit(approved):

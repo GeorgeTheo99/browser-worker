@@ -70,6 +70,15 @@ from controls import ControlStore
 from errors import WorkerError, fail
 from frames import FRAME_ACTIONS, NAVIGATION_INIT_SCRIPT, FrameStore, check_frame_access
 from live import LiveView
+from pickers import (
+    Picker,
+    choose,
+    focused_select,
+    open_picker,
+    popup_select,
+    select_at,
+    select_by_label,
+)
 from security import (
     NetworkPolicyError,
     PublicEgressProxy,
@@ -372,6 +381,10 @@ class BrowserSession:
     # A smaller viewport a person watching on a phone asked for while they control the page, so the site lays
     # itself out for that width; None is the worker's own size. The agent always gets its own size back.
     human_viewport: tuple[int, int] | None = None
+    # The dropdown list a person's click or key asked to open, shown to them by their viewer, not by Chromium.
+    picker: Picker | None = None
+    # A press on a select that opened a picker instead: its release goes nowhere either.
+    held_select: bool = False
     # Every short element reference `elements` gave, oldest first, each bound to its exact element; only
     # those the latest listing gave can be acted on.
     refs: dict[str, ElementHandle] = field(default_factory=dict)
@@ -782,6 +795,7 @@ class BrowserManager:
             if target["tag"] in {"iframe", "frame"}:
                 raise fail("point_in_frame")
             await self._no_upload(element)
+            await self._no_popup_select(element)
         finally:
             await element.dispose()
         try:
@@ -1222,7 +1236,34 @@ class BrowserManager:
                 page = self._active_page(session)
                 kind = event["type"]
                 try:
-                    if kind == "click":
+                    picker = await self._human_picker(session, page, event)
+                    if picker is not None:
+                        # Nothing reached the page but focus: the person's viewer shows the list.
+                        session.live.wake()
+                        return {"status": "ok", "session_id": session.id, "url": page.url, "picker": picker}
+                    if kind in {"click", "down"}:
+                        session.held_select = False
+                    if kind == "choose":
+                        held = session.picker
+                        if held is None or held.id != event["picker"]:
+                            raise fail("stale_picker")
+                        try:
+                            await choose(held, page, event["index"], DEFAULT_TIMEOUT_MS)
+                        except WorkerError as exc:
+                            if exc.code == "unsupported_control":
+                                raise  # a disabled option: the list still stands for another choice
+                            session.picker = None
+                            await held.dispose()
+                            raise
+                        except BaseException:
+                            session.picker = None
+                            await held.dispose()
+                            raise
+                        session.picker = None
+                        await held.dispose()
+                    elif kind == "up" and session.held_select:
+                        session.held_select = False  # its press opened a picker instead of reaching the page
+                    elif kind == "click":
                         await page.mouse.click(
                             event["x"], event["y"], button=event["button"], click_count=event["click_count"]
                         )
@@ -1269,6 +1310,36 @@ class BrowserManager:
                 return {"status": "ok", "session_id": session.id, "url": page.url}
             finally:
                 session.lock.release()
+
+    # Keys that move focus away from, or leave, a focused dropdown list rather than open it; shortcuts with
+    # Control or Meta go to the page too.
+    _PASSING_KEYS = frozenset({"Tab", "Shift+Tab", "Escape"})
+
+    async def _human_picker(self, session: BrowserSession, page: Page, event: dict[str, Any]) -> dict[str, Any] | None:
+        """A dropdown list a person's press or key would open (pickers.py), described for their viewer, with the
+        select focused as their press would leave it; None when the event goes to the page as usual."""
+        kind = event["type"]
+        if kind in {"click", "down"} and event["button"] == "left":
+            found = await select_at(page, event["x"], event["y"])
+        elif kind == "text" or (
+            kind == "key" and event["key"] not in self._PASSING_KEYS
+            and not event["key"].startswith(("Control+", "Meta+")) and "+Control+" not in event["key"]
+            and "+Meta+" not in event["key"]
+        ):
+            found = await focused_select(page)
+        else:
+            return None
+        if found is None:
+            return None
+        opened = await open_picker(page, found[1])
+        if opened is None:  # a disabled one: the press goes to the page, where it opens nothing
+            await found[1].dispose()
+            return None
+        if session.picker is not None:
+            await session.picker.dispose()
+        session.picker, view = opened
+        session.held_select = kind == "down"
+        return view
 
     async def _get(self, owner: str, session_id: str) -> BrowserSession:
         await self.sweep()
@@ -1559,6 +1630,13 @@ class BrowserManager:
         }'''):
             raise fail('approval_unavailable')
 
+    @staticmethod
+    async def _no_popup_select(element: ElementHandle) -> None:
+        """A click or keys on a dropdown list would open a list Chromium draws outside the page, which nothing
+        remote can see or use: its option is chosen with select_option (pickers.py)."""
+        if await popup_select(element):
+            raise fail("native_select")
+
     async def act(self, owner: str, session_id: str, action: str, **params: Any) -> dict[str, object]:
         try:
             return await self._act_impl(owner, session_id, action, **params)
@@ -1626,6 +1704,15 @@ class BrowserManager:
                         page, params["proposal_id"], execute=action == "execute_prepared"
                     )
                     return {"status": "ok", "session_id": session.id, **result}
+                if action == "select_option" and params.get("ref") is not None:
+                    frame, element, _owned = await self._target(session, page, frame, params, timeout_ms)
+                    try:
+                        await select_by_label(element, str(params["option"]), timeout_ms)
+                    except WorkerError:
+                        raise
+                    except Exception as exc:
+                        raise WorkerError("selecting failed") from exc
+                    return {**await self._state(session), "selected": str(params["option"])}
                 if action in {"controls", "expand_control", "select_option"}:
                     result = await session.controls.run(
                         page, action, str(params.get("control_id") or ""), params.get("option")
@@ -1759,6 +1846,7 @@ class BrowserManager:
                             if await element.owner_frame() != frame:
                                 raise fail("invalid_request")
                             await self._no_upload(element)
+                            await self._no_popup_select(element)
                             await element.click(timeout=timeout_ms)
                         finally:
                             if owned:
@@ -1777,6 +1865,7 @@ class BrowserManager:
                         if await element.owner_frame() != frame:
                             raise fail("invalid_request")
                         await self._no_upload(element)
+                        await self._no_popup_select(element)
                         # Disclose contenteditable targets: typed prose there is page content, not input.
                         editable = bool(await element.evaluate("el => el.isContentEditable"))
                         if params.get("clear", True):

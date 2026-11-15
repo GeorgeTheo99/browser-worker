@@ -41,6 +41,7 @@ from config import (
 )
 from errors import ERROR_MESSAGES
 from frames import FRAME_ACTIONS
+from pickers import MAX_PICKER_OPTIONS
 from security import NetworkPolicyError, parse_public_url
 
 logger = logging.getLogger("browser-worker.mcp")
@@ -302,8 +303,10 @@ async def browser_inspect(
     `upload` puts `files` (name, MIME type, base64 data) in a ref/selector file input, or in the file
     picker that clicking the ref/selector element opens.
     `elements` gives each listed element a short `ref` (e.g. `e12`) that `click`, `type`, `upload` and `screenshot`
-    accept instead of a selector (a screenshot of one captures only that element); `text` keeps elements whose label or nearby text contains it, and
-    `selector` lists only inside the elements it matches. `click_at` clicks the point `x`,`y` of the
+    accept instead of a selector (a screenshot of one captures only that element); `text` keeps elements whose label, nearby text,
+    or dropdown option contains it, and `selector` lists only inside the elements it matches. A dropdown list (a
+    `select`) lists its `options` and `selected` one: choose with `select_option`, its `ref` and an exact
+    option label (clicking or typing into one is refused, since Chromium draws its list outside the page). `click_at` clicks the point `x`,`y` of the
     visible page, in the CSS pixels of a screenshot with `full_page` false. `scroll` with `dx`/`dy` turns the
     mouse wheel by that many CSS pixels (positive `dy` goes down) over a `ref`/`selector` element, the point
     `x`,`y`, or else the middle of the visible page, and says which area moved; with only an element, it scrolls
@@ -321,8 +324,13 @@ async def browser_inspect(
             caller.require("inspect.persistent")
         if frame_id is not None and action not in FRAME_ACTIONS:
             raise WorkerError("frame_id is unsupported for this action")
-        if ref is not None and (action not in {"click", "type", "upload", "screenshot", "scroll"} or selector is not None or frame_id is not None):
-            raise WorkerError("ref replaces selector and frame_id for click, type, upload, screenshot and scroll")
+        if ref is not None and (
+            action not in {"click", "type", "upload", "screenshot", "scroll", "select_option"}
+            or selector is not None or frame_id is not None
+        ):
+            raise WorkerError(
+                "ref replaces selector and frame_id for click, type, upload, screenshot, scroll and select_option"
+            )
         if (files is not None) != (action == "upload"):
             raise WorkerError("files go with upload, and upload needs files")
         pointed = x is not None or y is not None
@@ -362,7 +370,12 @@ async def browser_inspect(
                 raise WorkerError("evaluate accepts no selector")
             if operation != "type" and (text is not None or submit or not clear):
                 raise WorkerError("input fields require type")
-        if action in {"controls", "expand_control", "select_option"}:
+        if action == "select_option" and ref is not None:
+            # A dropdown list by its ref: a page action like click, so it needs what click needs.
+            caller.require("inspect.interact")
+            if control_id is not None or any(value is not None for value in (text, script, arg, url, tab_index, scope_id, url_contains)) or submit:
+                raise WorkerError("select_option with a ref takes only the option")
+        elif action in {"controls", "expand_control", "select_option"}:
             if action != "controls":
                 caller.require("inspect.controls")
             if any(value is not None for value in (selector, text, script, arg, url, tab_index, scope_id, url_contains)) or submit:
@@ -437,6 +450,9 @@ async def browser_inspect(
                     params["arg"] = json.loads(encoded)
                 except (TypeError, ValueError, RecursionError) as exc:
                     raise WorkerError("arg must be bounded JSON") from exc
+        elif action == "select_option" and ref is not None:
+            params["ref"] = ref
+            params["option"] = _bounded_text(option, name="option", maximum=200, required=True)
         elif action in {"expand_control", "select_option"}:
             params["control_id"] = _bounded_text(control_id, name="control_id", maximum=128, required=True)
             if action == "select_option":
@@ -617,7 +633,10 @@ def _route_caller(request: Request, capability: str) -> Caller | JSONResponse:
 
 
 def _route_error(exc: WorkerError) -> JSONResponse:
-    status = {"invalid_session": 404, "session_busy": 409, "blocked_access": 403, "invalid_request": 400}.get(
+    status = {
+        "invalid_session": 404, "session_busy": 409, "stale_picker": 410, "blocked_access": 403,
+        "invalid_request": 400, "unsupported_control": 400,
+    }.get(
         exc.code, 502
     )
     return JSONResponse(
@@ -658,6 +677,8 @@ def parse_live_input(body: Any) -> dict[str, Any]:
         "reload": {"type"},
         # A person on a phone asks for a page laid out for their screen; without a size, the worker's own.
         "viewport": {"type", "width", "height"},
+        # The option a person picked from a dropdown list their click or key opened (a `picker`).
+        "choose": {"type", "picker", "index"},
     }
     if kind not in fields or not set(body) <= fields[kind]:
         raise WorkerError("input event is invalid", code="invalid_request")
@@ -697,6 +718,14 @@ def parse_live_input(body: Any) -> dict[str, Any]:
             ):
                 raise WorkerError("viewport is invalid", code="invalid_request")
             event.update(width=width, height=height)
+    elif kind == "choose":
+        picker, index = body.get("picker"), body.get("index")
+        if (
+            not isinstance(picker, str) or not 1 <= len(picker) <= 64
+            or not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < MAX_PICKER_OPTIONS
+        ):
+            raise WorkerError("choice is invalid", code="invalid_request")
+        event.update(picker=picker, index=index)
     elif kind == "navigate":
         url = body.get("url")
         try:
