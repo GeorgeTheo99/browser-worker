@@ -19,7 +19,7 @@ from patchright.async_api import TimeoutError as BrowserTimeoutError
 from controls import check_access
 from errors import fail
 from frames import DocumentRef, ancestry, check_frame_access
-from pickers import popup_select
+from pickers import control_kind
 from security import NetworkPolicyError, parse_public_url
 
 APPROVAL_TTL_SECONDS = 120
@@ -167,6 +167,14 @@ _ELEMENTS = r"""args => {
   // A dropdown list's options are chosen with select_option, not clicked: its row lists them (a list Chromium
   // draws outside the page can't be clicked), and words of an option find it.
   const choices = (el, needle) => {
+    if (el.localName === 'input' && el.list && !el.matches('[type=hidden],[type=password]')) {
+      // A field's suggestions (its datalist): values to type, those holding the filter's words first.
+      const all = [...el.list.querySelectorAll('option')].filter(o => !o.disabled && o.value && o.value.length <= 200)
+        .map(o => o.value);
+      const matching = needle ? all.filter(o => o.toLowerCase().includes(needle)) : [];
+      const shown = matching.length ? matching : all;
+      return {suggestions: shown.slice(0, 50), truncated: shown.length < all.length || shown.length > 50};
+    }
     if (el.localName !== 'select' || el.multiple) return null;
     const all = [...el.options], enabled = [];
     for (const o of all) {
@@ -232,7 +240,7 @@ _ELEMENTS = r"""args => {
     const same = twins.get(row.key);
     row.around = same.length > 1 ? near(row.el, same) : '';
     if (needle && !row.key.includes(needle) && !row.around.toLowerCase().includes(needle) &&
-        !row.choices?.options.some(o => o.toLowerCase().includes(needle))) continue;
+        !(row.choices?.options || row.choices?.suggestions || []).some(o => o.toLowerCase().includes(needle))) continue;
     // Page furniture (site header, menus, footer) goes after the page's own content.
     (row.el.closest(chrome) ? aside : main).push(row);
   }
@@ -244,8 +252,10 @@ _ELEMENTS = r"""args => {
       label: own, type: (el.getAttribute('type') || '').slice(0,100),
       href: (el.matches('a[href]') ? el.href : '').slice(0,8192),
       ...(around && around !== own ? {near: around} : {}),
-      ...(choices ? {options: choices.options, selected: choices.selected,
-        ...(choices.truncated ? {options_truncated: true} : {})} : {})});
+      ...(choices?.options ? {options: choices.options, selected: choices.selected,
+        ...(choices.truncated ? {options_truncated: true} : {})} : {}),
+      ...(choices?.suggestions ? {suggestions: choices.suggestions,
+        ...(choices.truncated ? {suggestions_truncated: true} : {})} : {})});
     els.push(el);
   }
   return {rows, els, truncated: skipped || kept.length > limit};
@@ -391,9 +401,11 @@ class ApprovalStore:
                         raise fail('selector_not_found')
                     if await proposal.element.owner_frame() != frame:
                         raise fail('approval_unavailable')
-                    if await popup_select(proposal.element):
-                        # Its list would open outside the page, where nobody can use it (pickers.py).
-                        raise fail('native_select')
+                    popup = await control_kind(proposal.element)
+                    # Its picker would open outside the page, where nobody can use it (pickers.py); a date,
+                    # time or colour field still takes typing.
+                    if popup == 'select' or (popup and operation == 'click'):
+                        raise fail('native_select' if popup == 'select' else 'native_picker')
                     proposal.snapshot = await proposal.element.evaluate_handle(r"""(el, args) => {
                       const inspect = """ + _SNAPSHOT + r""";
                       const saved = inspect(el, args.command);

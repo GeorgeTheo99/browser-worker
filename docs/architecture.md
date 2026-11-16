@@ -136,7 +136,7 @@ Common fields are optional at the JSON-Schema layer for model compatibility and 
 - **Live view** (`inspect.live`), plain authenticated HTTP routes beside `/mcp`, owner-bound like artifacts:
   - `GET /sessions` → `{status, sessions:[{session_id, profile, persistent, url, tab_count, idle_expires_in_seconds}]}`.
   - `GET /sessions/{id}/live` → `text/event-stream` of `state` (`{url, active_tab, tab_count}`), `frame` (`{seq, data: base64 JPEG, width, height}` in CSS viewport pixels, at most ~10/s, latest-wins), and a final `closed`; `: keepalive` comments every 15 s. A Chromium CDP screencast follows the active tab and runs only while at least one of at most 4 viewers is attached.
-  - `POST /sessions/{id}/input` (≤ 16 KiB JSON) applies one human event: `click {x,y,button?,click_count?}`, `down {x,y,button?}`/`move {x,y}`/`up {x,y,button?}` (press, hold and drag), `wheel {x,y,dx?,dy?}`, `key {key}` (Playwright key names with optional modifiers), `text {text ≤ 2000}`, `navigate {url}` (public URL policy), `back`, `forward`, `reload`, `viewport {width 320–1440, height 240–900}` (or `viewport {}` to restore), and `choose {picker, index}` (see Dropdown lists). The viewport event lays the active tab out for a person watching on a phone; a tab they switch to gets the same size, and the screencast restarts so the next frame has it. The agent always acts at the worker's own size: its next action, and the last viewer leaving, restore every tab. Events are trusted browser input from the supervising person, serialize with agent actions on the session lock (409 `session_busy` after 10 s), and invalidate discovered controls/approvals. Access/CAPTCHA detection does not block human input: this is how a person completes a sign-in or challenge the agent must not bypass.
+  - `POST /sessions/{id}/input` (≤ 16 KiB JSON) applies one human event: `click {x,y,button?,click_count?}`, `down {x,y,button?}`/`move {x,y}`/`up {x,y,button?}` (press, hold and drag), `wheel {x,y,dx?,dy?}`, `key {key}` (Playwright key names with optional modifiers), `text {text ≤ 2000}`, `navigate {url}` (public URL policy), `back`, `forward`, `reload`, `viewport {width 320–1440, height 240–900}` (or `viewport {}` to restore), `choose {picker, index}` and `set {picker, value}` (see Pickers drawn outside the page). The viewport event lays the active tab out for a person watching on a phone; a tab they switch to gets the same size, and the screencast restarts so the next frame has it. The agent always acts at the worker's own size: its next action, and the last viewer leaving, restore every tab. Events are trusted browser input from the supervising person, serialize with agent actions on the session lock (409 `session_busy` after 10 s), and invalidate discovered controls/approvals. Access/CAPTCHA detection does not block human input: this is how a person completes a sign-in or challenge the agent must not bypass.
 
 ### Frame contract
 
@@ -146,41 +146,61 @@ Common fields are optional at the JSON-Schema layer for model compatibility and 
 - Child `about:blank`/`about:srcdoc` documents are readable under a checked public ancestry. `origin` is the effective browser origin, including inherited origins and literal `"null"` for opaque sandboxed documents; it is not inferred from the URL. Their text returns the actual `about:` URL, never a parent's public URL. Treat these reads as observations, not public-URL evidence. Guarded `srcdoc` approvals work where Chromium supplies Navigation API/current-entry authority. Initial blank and opaque sandboxed documents without that authority fail closed for approvals (`approval_unavailable`); read-only discovery/extraction still works. Other non-HTTP schemes are refused.
 - Frame references and ancestry checks are preflight, not a lock on the page. Script evaluation remains untrusted and can mutate the selected realm and accessible related realms; client script-taint/evidence rules must not be relaxed for frame reads or evaluations.
 
-### Dropdown lists (`<select>`)
+### Pickers drawn outside the page (`pickers.py`)
 
-Chromium draws a `<select>`'s list as a popup outside the page: an OS menu on macOS, a separate window on Linux.
-Nothing that sees or drives the page reaches it: the live view's screencast never shows it, CDP key events go to
-the page rather than the menu, and screenshots miss it. A remote click that opens one leaves a list nobody can see
-or use (it stays open on the Mac's screen). So the worker never lets remote input open one (`pickers.py`), and
-offers the choice through its own channel instead:
+Chromium draws some pickers as popups outside the page: a `<select>`'s list (an OS menu on macOS, a separate
+window on Linux), the pickers of `date`, `time`, `datetime-local`, `month` and `week` inputs, a `color` input's
+colour panel, and a `datalist`'s suggestions. Nothing that sees or drives the page reaches them: the live view's
+screencast never shows them, CDP input doesn't reach them, and screenshots miss them. A remote click that opens
+one leaves a picker nobody can see or use (on a Mac it stays open on the screen). So the worker never lets remote
+input open one, and offers the choice through its own channel instead:
 
-- **The agent.** An `elements` row for a single-choice select adds `options` (the labels that can be picked, at most
-  50, each ≤ 200 characters: with `text`, those that contain it, so a long country list still lists the one wanted;
-  `options_truncated` when others aren't listed) and `selected` (the chosen option's label), and `text` also
-  matches option labels. `select_option` with that row's `ref` and an exact `option` label (requires
-  `inspect.interact`, like `click`) focuses the select and picks the option as a person picking it from the list
-  does: `input` and `change` events. Errors: `unknown_option` (no option has exactly that label),
-  `ambiguous_control` (several do), `unsupported_control` (disabled option, group, or select), `not_a_select`
-  (the ref isn't a single-choice select: click a custom dropdown and then its option). `click`, `click_at`, and
-  `type` on such a select (and `prepare_action` of a click on one) fail with `native_select` and nothing reaches
-  the page.
-- **A person in the live view.** A left `click` or `down` on such a select (through open shadow roots and embedded
-  frames, other origins included), or a `key` (other than Tab, Shift+Tab, Escape, and Control or Meta shortcuts)
-  or `text` while one is focused,
-  doesn't reach the page: the worker focuses the select and the input response carries
-  `picker: {id, label, options: [{label, disabled, group}], selected, truncated, box}` (at most 1000 options;
-  `selected` is -1 when the selected one is past them;
-  `box` is `[x, y, width, height]` on the visible page, in CSS pixels, for the viewer to show its list beside
-  the select). The `up` that ends such a `down` is dropped. The viewer answers with `choose {picker, index}`,
-  which picks that option the same way, once; `stale_picker` (410) if the picker isn't the session's latest or
-  the select's options changed (show it again; another picker's id leaves the latest one standing),
-  `unsupported_control` (400) for a disabled option (the picker still stands).
-- A select whose list is part of the page (a listbox with `size` > 1, or a customizable `appearance: base-select`
-  one) is ordinary page content: clicks and keys reach it as usual.
-- Not covered: a select inside a closed shadow root (hit-testing can't see into it), a page script calling
-  `showPicker()` itself, a select inside a CSS-transformed or zoomed frame (the point's offset is off), and other
-  popups Chromium draws outside the page: date, time and colour pickers and `datalist` suggestions (their fields
-  take typed input, which reaches the page).
+- **The agent.** An `elements` row for a single-choice select adds `options` (the labels that can be picked, at
+  most 50, each ≤ 200 characters: with `text`, those that contain it, so a long country list still lists the one
+  wanted; `options_truncated` when others aren't listed) and `selected` (the chosen option's label); a field with
+  a datalist adds `suggestions` (its option values, chosen the same way; `suggestions_truncated`). `text` also
+  matches options and suggestions. `select_option` with a select's `ref` and an exact `option` label (requires
+  `inspect.interact`, like `click`) picks it as a person does: focus, then `input` and `change`. Errors:
+  `unknown_option`, `ambiguous_control` (several options have that label), `unsupported_control` (disabled
+  option, group, or select), `not_a_select`. A date, time or colour field takes its value with `type`
+  (`clear=true`: `YYYY-MM-DD`, `HH:MM`, `YYYY-MM-DDTHH:MM`, `YYYY-MM`, `YYYY-Www`, `#rrggbb`). `click`,
+  `click_at` and `prepare_action` of a click on a select fail with `native_select`, on a date, time or colour
+  field with `native_picker`; `type` into a select fails with `native_select`. Nothing reaches the page then.
+- **A person in the live view.** A left `click` or `down` is hit-tested by Blink itself (CDP
+  `DOM.getNodeForLocation`): through shadow roots of every kind, closed ones included, frames drawn by the same
+  process (CSS transforms included), and, by where each is placed, frames another process draws. On a select,
+  date, time or colour field that isn't disabled or read-only, the press reaches the page only as focus, and
+  the input response carries a `picker`:
+  `{id, kind: "select"|"date"|"color", label, box, ...}`; a select adds `options: [{label, disabled, group}]`
+  (at most 1000), `selected` (-1 when past them) and `truncated`; a date field `input_type`, `value`, `min`,
+  `max`, `step`; a colour field `value`. `box` is `[x, y, width, height]` on the visible page, in CSS pixels. The
+  `up` that ends such a `down` is dropped. A `key` (other than Tab, Shift+Tab, Escape, and Control or Meta
+  shortcuts) or `text` while a select has the focus shows its picker too (a select in a closed shadow root:
+  while the one last shown keeps the focus); a date or colour field takes its keys. The viewer answers with
+  `choose {picker, index}` (a select's option) or `set {picker, value}` (a date, time or colour value as above;
+  `""` clears a date field), which apply once (a value the field can't hold, such as `2026-02-30`, leaves it as
+  it was): `stale_picker` (410) if the picker isn't
+  the session's latest, was used, or its field changed; `unsupported_control` or `invalid_request` (400), and the
+  picker still stands, for a disabled option, a value the field can't hold, or the wrong event for its kind.
+- **Suggestions.** A field with a datalist keeps its clicks and keys. After a `click`, `up`, `key` or `text`
+  that reached the page, if the focused field has suggestions matching what it holds (as Chromium offers them),
+  the response carries a `picker` of `kind: "suggestions"` (options, as for a select, from each option's value
+  and label); `choose` fills that value in and fires `input` (the field fires `change` when it is left, as after
+  typing). Chromium's own suggestion popup may still open, unseen; it needs no answer.
+- **Pickers that open anyway.** After every `click`, `up`, `key` or `text` that reached the page, and after the
+  agent's `click`, `click_at` and `type`, the worker looks for a picker that is open (`select:open,
+  input:open`, in every frame, through open shadow roots), such as one a page script opened with `showPicker()`
+  behind a button, also one opened a frame later. Only a frame with fresh user activation is searched through
+  its shadow roots. The picker is closed (the field loses focus; a colour panel's field turns into a text field
+  and back, keeping its value) and handed to the person as a `picker`, or reported to the agent as
+  `closed_picker: {kind, label, input_type?}`.
+- Scripts on a field a press found run in an isolated world of its frame; on one found by focus or by the
+  open-picker check, in the page's world, like the worker's other page scripts.
+- A select whose list is part of the page (a listbox with `size` > 1, or a customizable `appearance:
+  base-select` one) is ordinary page content: clicks and keys reach it as usual.
+- Left as they are: a picker a page script opens without any input, or more than a frame after it; one inside
+  a closed shadow root that a press didn't find (the open-picker check sees open roots only); frames past the
+  first 30 of a page; and Chromium's own datalist popup (above).
 
 ### Research dropdown contract
 
@@ -199,7 +219,7 @@ offers the choice through its own channel instead:
 
 `inspect.confirmed` is a trusted client-server capability, **not proof of human consent supplied by the worker**. My AI must expose `elements` to its model, but keep all three approval protocol actions out of its model schema. Its backend prepares the model's requested operation, privately persists the preview, displays it to the user, and calls execution only after an explicit user confirmation. Denial calls discard. Clear private text/script/argument details after every terminal outcome; never automatically retry an execution after an error or lost response. Pi's direct `click`/`type`/`evaluate` grants are unchanged.
 
-- `elements` requires `inspect.read`; optional `limit` defaults to 50 (schema `1..200`, output capped at 100). Optional `text` (≤ 200) keeps elements whose label, or `near` text, contains it (case-insensitive); optional `selector` lists only inside the elements it matches (`selector_not_found`/`invalid_selector` otherwise). Returns `{status:"ok",session_id,elements:[{ref,selector,tag,role,label,type,href,near?,options?,selected?,options_truncated?}],truncated}` (`options`/`selected` for a single-choice select: see Dropdown lists). The page's own content comes first, then elements inside its header, navigation, and footer landmarks. Scans at most 3000 interactive candidates in the selected document (discovery does not enumerate shadow roots). Structural CSS selectors are unique at discovery; labels are at most 500 characters, roles/types 100, selectors 2000, hrefs 8192. `near` (≤ 160) appears only for elements whose label repeats: the text of the largest block around it that holds no other element of that label (a cart row for its Delete button). Hidden elements and literal private/unsafe hrefs are omitted or blanked. No input values, textarea content, or editable content are read as labels. These are untrusted observations.
+- `elements` requires `inspect.read`; optional `limit` defaults to 50 (schema `1..200`, output capped at 100). Optional `text` (≤ 200) keeps elements whose label, or `near` text, contains it (case-insensitive); optional `selector` lists only inside the elements it matches (`selector_not_found`/`invalid_selector` otherwise). Returns `{status:"ok",session_id,elements:[{ref,selector,tag,role,label,type,href,near?,options?,selected?,options_truncated?}],truncated}` (`options`/`selected` for a single-choice select, `suggestions` for a field with a datalist: see Pickers drawn outside the page). The page's own content comes first, then elements inside its header, navigation, and footer landmarks. Scans at most 3000 interactive candidates in the selected document (discovery does not enumerate shadow roots). Structural CSS selectors are unique at discovery; labels are at most 500 characters, roles/types 100, selectors 2000, hrefs 8192. `near` (≤ 160) appears only for elements whose label repeats: the text of the largest block around it that holds no other element of that label (a cart row for its Delete button). Hidden elements and literal private/unsafe hrefs are omitted or blanked. No input values, textarea content, or editable content are read as labels. These are untrusted observations.
 - `ref` (`e1`, `e2`, …) is bound to the exact listed element. `click`, `type`, `screenshot`, `scroll`, and `select_option` accept it instead of `selector` (and without `frame_id`: the element knows its frame). Only the latest successful `elements` listing's refs can be acted on, but an element listed before (in any earlier listing of its document, whatever the filter) keeps its ref, so listing again cannot turn one uncertain click into two differently named ones; a new element gets a new ref, never reused within a session. A session remembers at most 1000 refs (oldest unlisted ones go first). A ref whose element left its document, or that belongs to another tab, fails with `stale_ref` and is never re-resolved to a look-alike. `near` is built like labels: never from input, textarea, select, or editable content, nor from a block that is itself editable or inside editable content.
 - `click_at` requires `inspect.interact`, `x` (0..3840) and `y` (0..2160): a native click at that point of the visible page in CSS pixels, as in a `screenshot` with `full_page=false` (which returns `viewport:{width,height}`). A `screenshot` with `ref` or `selector` scrolls that element into view and captures only that element (no `viewport`, and no `track`; `element is too large…` past the capture bounds). The point is checked first: outside the viewport → `point_outside`; inside any child frame's box, including a frame in a closed shadow root → `point_in_frame` (a frame's checks apply only through `frames` and `frame_id`); a file-upload target (hit-tested through open shadow roots) → `approval_unavailable`. Success returns the state plus `clicked:{tag,label}` of the element hit.
 - `scroll` requires `inspect.interact`. With `dx`/`dy` (CSS pixels, each -10000..10000, not both 0; positive `dy` scrolls down) it turns the native mouse wheel over the middle of a `ref`/`selector` element's part inside its scrolling area and the visible page (the element is brought into view first), over the point `x`,`y` of the visible page, or else over the middle of the visible page, and returns the state plus `scrolled:{area,moved,x,y,max_x,max_y}`: the position and limits of the area that should take the wheel, the nearest scrollable ancestor of what is under the wheel with room left that way (`area`), else that document's page (`page`, or `frame` inside an embedded frame), after its scroll starts within 300 ms and settles (at most 1.5 s). `moved: false` means that area did not move, for example at its end. A wheel that would land in a frame embedded in the target's document fails with `point_in_frame`; `frame_id` goes with a `selector` only. With only `ref`/`selector`, it scrolls that element into view and returns the state. Like any native input, the wheel can run page handlers (infinite scroll loads more).

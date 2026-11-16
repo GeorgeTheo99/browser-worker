@@ -41,7 +41,7 @@ from config import (
 )
 from errors import ERROR_MESSAGES
 from frames import FRAME_ACTIONS
-from pickers import MAX_PICKER_OPTIONS
+from pickers import MAX_PICKER_OPTIONS, MAX_VALUE
 from security import NetworkPolicyError, parse_public_url
 
 logger = logging.getLogger("browser-worker.mcp")
@@ -677,8 +677,10 @@ def parse_live_input(body: Any) -> dict[str, Any]:
         "reload": {"type"},
         # A person on a phone asks for a page laid out for their screen; without a size, the worker's own.
         "viewport": {"type", "width", "height"},
-        # The option a person picked from a dropdown list their click or key opened (a `picker`).
+        # The option a person picked from a picker the worker showed them instead of Chromium (a `picker`), or
+        # the date, time or colour they set in one.
         "choose": {"type", "picker", "index"},
+        "set": {"type", "picker", "value"},
     }
     if kind not in fields or not set(body) <= fields[kind]:
         raise WorkerError("input event is invalid", code="invalid_request")
@@ -726,6 +728,14 @@ def parse_live_input(body: Any) -> dict[str, Any]:
         ):
             raise WorkerError("choice is invalid", code="invalid_request")
         event.update(picker=picker, index=index)
+    elif kind == "set":
+        picker, value = body.get("picker"), body.get("value")
+        if (
+            not isinstance(picker, str) or not 1 <= len(picker) <= 64
+            or not isinstance(value, str) or len(value) > MAX_VALUE
+        ):
+            raise WorkerError("value is invalid", code="invalid_request")
+        event.update(picker=picker, value=value)
     elif kind == "navigate":
         url = body.get("url")
         try:

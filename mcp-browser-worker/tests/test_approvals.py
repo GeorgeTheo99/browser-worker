@@ -95,6 +95,8 @@ async def test_discovery_and_prepare_are_readonly_exact_execution_once(approved)
     # A dropdown list's own list opens outside the page, where nobody could use it: refused up front.
     await page.evaluate("document.body.insertAdjacentHTML('beforeend', '<select id=plan><option>A</option></select>')")
     assert (await call(sid, 'prepare_action', operation='click', selector='#plan'))['code'] == 'native_select'
+    await page.evaluate("document.body.insertAdjacentHTML('beforeend', '<input id=due type=date>')")
+    assert (await call(sid, 'prepare_action', operation='click', selector='#due'))['code'] == 'native_picker'
 
 
 async def test_typing_can_update_unrelated_validation_text_before_approved_submit(approved):
