@@ -16,11 +16,11 @@ from browser_runtime import BrowserManager
 from errors import WorkerError
 
 PAGE = '''<!doctype html><title>Pay</title><body style="margin:0">
-<form action="/pay"><label for=method>Payment Method</label>
+<form action="/pay"><label>Payment Method
 <select id=method name=method style="position:absolute;left:20px;top:20px;width:300px;height:30px">
 <option value="" disabled selected>Payment Method</option><option>Bank Account (Checking)</option>
 <option>Bank Account (Savings)</option><option>Card or Digital Wallet</option><option>Card or Digital Wallet</option>
-<optgroup label="Other" disabled><option>Cash</option></optgroup></select>
+<optgroup label="Other" disabled><option>Cash</option></optgroup></select></label>
 <select id=list size=3 aria-label=Plan style="position:absolute;left:20px;top:80px;width:300px;height:60px">
 <option>Basic</option><option>Plus</option></select>
 <select id=off disabled aria-label=Off style="position:absolute;left:400px;top:20px;width:100px;height:30px"><option>Only</option></select>

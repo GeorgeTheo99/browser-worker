@@ -58,7 +58,16 @@ _VALUES = {
     "color": re.compile(r"#[0-9a-f]{6}"),
 }
 
-_WORDS = r"""const words = n => (n?.innerText || n?.textContent || '').replace(/\s+/g, ' ').trim();
+_WORDS = r"""// A label's own words: not those of a control inside it (a select's options, a field's text).
+  const words = n => {
+    if (!n) return '';
+    const walker = document.createTreeWalker(n, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {acceptNode: c =>
+      c.nodeType === 1 && c.matches('select,datalist,textarea,input,script,style,[contenteditable]:not([contenteditable="false"])')
+        ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT});
+    let out = '', c, count = 0;
+    while ((c = walker.nextNode()) && count++ < 400 && out.length < 400) if (c.nodeType === 3) out += c.textContent + ' ';
+    return out.replace(/\s+/g, ' ').trim();
+  };
   const nameOf = el => (el.getAttribute('aria-label') ||
     (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).slice(0, 6)
       .map(id => words(el.getRootNode().getElementById?.(id))).join(' ') ||
