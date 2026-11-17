@@ -356,3 +356,46 @@ async def test_the_agent_types_dates_and_colours_and_hears_about_a_picker_its_cl
     assert clicked["status"] == "ok" and clicked["closed_picker"] == {"kind": "date", "label": "When", "input_type": "date"}
     assert await page.evaluate("document.querySelector('#when').matches(':open')") is False
     assert when["type"] == "date"
+
+
+async def test_the_open_picker_check_skips_a_frame_that_never_answers(monkeypatch: pytest.MonkeyPatch):
+    # delta.com's demdex tracking frame never answered a script (2026-11-16): the agent's click and typing waited
+    # on it until Myai gave up, and the worker closed the browser with its sign-in.
+    import pickers
+
+    class Element:
+        closed = False
+
+        async def evaluate(self, script):
+            Element.closed = True
+
+    class Handle:
+        def __init__(self, element):
+            self.element = element
+
+        def as_element(self):
+            return self.element
+
+        async def dispose(self):
+            pass
+
+    class Frame:
+        def __init__(self, answer):
+            self.answer = answer
+
+        async def evaluate_handle(self, script):
+            if self.answer is None:
+                await asyncio.Event().wait()
+            return Handle(self.answer)
+
+    class Page:
+        frames = [Frame(None), Frame(Element())]
+
+    monkeypatch.setattr(pickers, "FRAME_ANSWER_SECONDS", 0.05)
+    found = await asyncio.wait_for(pickers.open_popup(Page()), 2)
+    assert found is not None and Element.closed
+
+    # However many frames hang, the check as a whole ends in time.
+    monkeypatch.setattr(pickers, "OPEN_POPUP_SECONDS", 0.2)
+    Page.frames = [Frame(None)] * 30
+    assert await asyncio.wait_for(pickers.open_popup(Page()), 2) is None

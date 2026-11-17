@@ -29,8 +29,10 @@ base-select` one) is ordinary page content and is left alone.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import secrets
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -46,6 +48,11 @@ MAX_VALUE = 64
 # How deep a point is followed into frames of other processes, and how many frames are searched.
 MAX_FRAME_DEPTH = 6
 MAX_SCANNED_FRAMES = 30
+# A frame whose scripts never answer (delta.com's demdex tracking frame, 2026-11-16) is skipped after this long,
+# and the whole open-picker check gives up after OPEN_POPUP_SECONDS: unbounded, one such frame held the agent's
+# click or typing until its caller gave up, and the worker then closed the browser with its sign-in.
+FRAME_ANSWER_SECONDS = 1.0
+OPEN_POPUP_SECONDS = 3.0
 DATE_TYPES = frozenset({"date", "time", "datetime-local", "month", "week"})
 # Kinds whose picker opens outside the page on a click; suggestions show while the field is used.
 POPUP_KINDS = frozenset({"select", "date", "color"})
@@ -479,10 +486,15 @@ async def focused(page: Page) -> HandleTarget | None:
 
 async def open_popup(page: Page) -> HandleTarget | None:
     """A picker that opened outside the page anyway (a page script's showPicker, a shortcut), closed now."""
+    deadline = time.monotonic() + OPEN_POPUP_SECONDS
     for frame in page.frames[:MAX_SCANNED_FRAMES]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
         try:
-            handle = await frame.evaluate_handle(_OPEN)
-        except BrowserError:
+            async with asyncio.timeout(min(FRAME_ANSWER_SECONDS, remaining)):
+                handle = await frame.evaluate_handle(_OPEN)
+        except (BrowserError, TimeoutError):
             continue
         element = handle.as_element()
         if element is None:
