@@ -352,6 +352,23 @@ _SCROLL_SETTLED = """(n, [x0, y0]) => new Promise(done => {
   };
   requestAnimationFrame(tick);
 })"""
+# What the agent looked for or read, scrolled smoothly to the middle of its page when it is out of sight, so a
+# person watching the live view sees where the agent looks. Resolves once it stops moving (or didn't start to).
+_SHOW = """el => new Promise(done => {
+  const box = el.getBoundingClientRect();
+  if ((!box.width && !box.height) || (box.bottom > 0 && box.top < innerHeight && box.right > 0 && box.left < innerWidth)) return done(false);
+  el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'smooth'});
+  const start = performance.now();
+  let last = null, still = 0;
+  const tick = () => {
+    const r = el.getBoundingClientRect(), at = r.top + ',' + r.left, waited = performance.now() - start;
+    still = at === last ? still + 1 : 0;
+    last = at;
+    const moved = r.top !== box.top || r.left !== box.left;
+    if ((moved ? still >= 3 : waited >= 300) || waited >= 1500) done(moved); else requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+})"""
 
 
 @dataclass(slots=True)
@@ -1688,6 +1705,16 @@ class BrowserManager:
             raise fail("native_picker")
 
     @staticmethod
+    async def _show(element: ElementHandle) -> None:
+        """Scroll what the agent found or read into view for whoever watches the live view (_SHOW); it never
+        fails or holds up the action that found it."""
+        try:
+            async with asyncio.timeout(2):
+                await element.evaluate(_SHOW)
+        except (BrowserError, TimeoutError) as exc:
+            logger.debug("showing an element ended: %s", type(exc).__name__)
+
+    @staticmethod
     async def _closed_picker(page: Page) -> dict[str, object]:
         """A picker the agent's action opened anyway (a page script's showPicker), closed: what it was for."""
         target = await open_popup(page)
@@ -1746,6 +1773,9 @@ class BrowserManager:
                         frame, int(params.get("limit") or 50), text=params.get("text"), within=params.get("selector")
                     )
                     await self._replace_refs(session, frame, result["elements"], handles)
+                    if result["elements"] and (params.get("text") or params.get("selector")):
+                        # By its ref's handle: one listed before keeps that one, and this listing's is let go.
+                        await self._show(session.refs[result["elements"][0]["ref"]])
                     return {"status": "ok", "session_id": session.id, **result}
                 if action in {"prepare_action", "execute_prepared", "discard_prepared"} and (
                     self._sessions.get(session_id) is not session or session.disposed
@@ -1832,6 +1862,7 @@ class BrowserManager:
                     return await self._state(session)
                 if action == "extract_text":
                     selector = params.get("selector")
+                    shown: ElementHandle | None = None
                     max_chars = min(MAX_TEXT_CHARS, int(params.get("max_chars") or 20_000))
                     try:
                         async with asyncio.timeout(min(timeout_ms, 3000) / 1000):
@@ -1854,12 +1885,20 @@ class BrowserManager:
                                     "(el, limit) => { if (!el.isConnected || el.ownerDocument !== document) throw new Error('stale target'); return {text:(el.innerText || el.textContent || '').slice(0, limit + 1), url:location.href, title:document.title.slice(0,500)}; }",
                                     max_chars,
                                 )
+                                if selector:  # shown once read, outside the time the read has
+                                    shown, element = element, None
                             finally:
-                                await element.dispose()
+                                if element is not None:
+                                    await element.dispose()
                     except (TimeoutError, BrowserTimeoutError) as exc:
                         raise fail("extraction_timeout") from exc
                     except BrowserError as exc:
                         raise fail("invalid_selector") from exc
+                    if shown is not None:
+                        try:
+                            await self._show(shown)
+                        finally:
+                            await shown.dispose()
                     return {
                         "status": "ok",
                         "session_id": session.id,

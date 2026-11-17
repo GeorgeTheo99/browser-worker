@@ -714,3 +714,31 @@ async def test_only_a_captcha_that_shows_blocks_the_page(browser):
     await page.evaluate("""() => document.body.insertAdjacentHTML('beforeend',
       '<div class=g-recaptcha style="width:304px;height:78px"></div>')""")
     assert (await call(sid, "extract_text"))["code"] == "blocked_access"
+
+
+@pytest.mark.browser
+async def test_what_the_agent_looks_for_or_reads_is_scrolled_into_view_for_the_live_view(browser):
+    _, sid, page, _, _ = browser
+    await page.evaluate('''() => {
+      document.body.style.margin = 0;
+      document.body.innerHTML = '<button id=top>Top</button>' +
+        '<div id=far style="position:absolute;top:5000px;height:100px"><a href="/activity">Account Activity</a></div>' +
+        '<p id=deep style="position:absolute;top:9000px">Posted MQDs</p>';
+    }''')
+    token = auth._current_caller.set(Caller("research", frozenset({"inspect.read", "inspect.interact"})))
+    try:
+        in_view = "e => { const r = document.querySelector(e).getBoundingClientRect(); return r.top >= 0 && r.bottom <= innerHeight; }"
+        # Listing everything moves nothing; something visible already stays where it is.
+        assert (await call(sid, "elements"))["status"] == "ok" and await page.evaluate("scrollY") == 0
+        assert (await call(sid, "elements", text="Top"))["elements"] and await page.evaluate("scrollY") == 0
+        # What it looks for by text, and a part of the page it reads, end up in the middle of the page.
+        found = await call(sid, "elements", text="Account Activity")
+        assert found["elements"][0]["label"] == "Account Activity"
+        assert await page.evaluate(in_view, "#far a")
+        read = await call(sid, "extract_text", selector="#deep")
+        assert read["text"] == "Posted MQDs" and await page.evaluate(in_view, "#deep")
+        # Reading the whole page doesn't scroll it.
+        before = await page.evaluate("scrollY")
+        assert (await call(sid, "extract_text"))["status"] == "ok" and await page.evaluate("scrollY") == before
+    finally:
+        auth._current_caller.reset(token)
