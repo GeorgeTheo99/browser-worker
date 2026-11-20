@@ -1288,7 +1288,14 @@ class BrowserManager:
                         await page.mouse.wheel(event["dx"], event["dy"])
                     elif kind in {"down", "move", "up"}:
                         # Separate press, move and release let a person hold or drag (press-and-hold checks, sliders).
-                        await page.mouse.move(event["x"], event["y"])
+                        # A move retraces the person's path at its own pace, not one jump to where it ended.
+                        path, started = event.get("path", ()), time.monotonic()
+                        for x, y, at in path:
+                            if (wait := started + at / 1000 - time.monotonic()) > 0:
+                                await asyncio.sleep(wait)
+                            await page.mouse.move(x, y)
+                        if not path or path[-1][:2] != (event["x"], event["y"]):
+                            await page.mouse.move(event["x"], event["y"])
                         if kind == "down":
                             await page.mouse.down(button=event["button"])
                         elif kind == "up":

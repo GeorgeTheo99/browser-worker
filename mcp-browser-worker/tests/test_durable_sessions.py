@@ -171,6 +171,10 @@ def test_download_names_are_sanitized() -> None:
         ({"type": "wheel", "x": 1, "y": 1, "dy": 400}, {"type": "wheel", "x": 1.0, "y": 1.0, "dx": 0.0, "dy": 400.0}),
         ({"type": "down", "x": 5, "y": 6}, {"type": "down", "x": 5.0, "y": 6.0, "button": "left"}),
         ({"type": "move", "x": 7, "y": 8}, {"type": "move", "x": 7.0, "y": 8.0}),
+        (
+            {"type": "move", "x": 7, "y": 8, "path": [[1, 2, 0], [3.5, 4, 16], [5, 6, 16]]},
+            {"type": "move", "x": 7.0, "y": 8.0, "path": [(1.0, 2.0, 0), (3.5, 4.0, 16), (5.0, 6.0, 16)]},
+        ),
         ({"type": "up", "x": 9, "y": 10, "button": "right"}, {"type": "up", "x": 9.0, "y": 10.0, "button": "right"}),
         ({"type": "key", "key": "Control+a"}, {"type": "key", "key": "Control+a"}),
         ({"type": "key", "key": "Enter"}, {"type": "key", "key": "Enter"}),
@@ -196,6 +200,15 @@ def test_live_input_accepts_bounded_events(body: dict[str, Any], expected: dict[
         {"type": "click", "x": 0, "y": 0, "selector": "#a"},
         {"type": "down", "x": 0, "y": 0, "button": "back"},
         {"type": "move", "x": 0, "y": 0, "button": "left"},
+        {"type": "move", "x": 0, "y": 0, "path": []},
+        {"type": "move", "x": 0, "y": 0, "path": [[1, 1, 20], [2, 2, 10]]},
+        {"type": "move", "x": 0, "y": 0, "path": [[1, 1, 1001]]},
+        {"type": "move", "x": 0, "y": 0, "path": [[1, 1, True]]},
+        {"type": "move", "x": 0, "y": 0, "path": [[1, 1, 1.5]]},
+        {"type": "move", "x": 0, "y": 0, "path": [[-1, 1, 0]]},
+        {"type": "move", "x": 0, "y": 0, "path": [[1, 1]]},
+        {"type": "move", "x": 0, "y": 0, "path": [[1, 1, 0]] * 33},
+        {"type": "down", "x": 0, "y": 0, "path": [[1, 1, 0]]},
         {"type": "up", "y": 0},
         {"type": "key", "key": "a b"},
         {"type": "text", "text": ""},
@@ -330,6 +343,21 @@ async def test_durable_profile_downloads_and_live_takeover(
         await manager.human_input("owner", session_id, {"type": "up", "x": 220.0, "y": 320.0, "button": "left"})
         held = await manager.act("owner", session_id, "evaluate", script="document.querySelector('#h').dataset.up")
         assert held["result"] == "220:20"
+        # A move retraces its path at the person's pace, held down all the way.
+        await manager.act("owner", session_id, "evaluate", script=(
+            "window.moves = []; addEventListener('mousemove', (e) => moves.push([e.clientX, e.buttons, performance.now()]))"
+        ))
+        await manager.human_input("owner", session_id, {"type": "down", "x": 20.0, "y": 320.0, "button": "left"})
+        await manager.human_input("owner", session_id, {
+            "type": "move", "x": 80.0, "y": 320.0, "path": [(40.0, 320.0, 0), (60.0, 321.0, 120), (80.0, 320.0, 130)],
+        })
+        await manager.human_input("owner", session_id, {"type": "up", "x": 80.0, "y": 320.0, "button": "left"})
+        moves = (await manager.act("owner", session_id, "evaluate", script="moves"))["result"]
+        pressed = [(x, at) for x, buttons, at in moves if buttons == 1]
+        assert [x for x, _ in pressed][:3] == [40, 60, 80]
+        # The path ends at the move's point, so only the release moves there again.
+        assert [x for x, _ in pressed].count(80) == 2
+        assert pressed[1][1] - pressed[0][1] >= 100
 
         # A person on a phone gets the page laid out for their screen, and the frames say so.
         size = "[innerWidth, innerHeight]"

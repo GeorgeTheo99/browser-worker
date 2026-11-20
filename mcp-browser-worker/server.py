@@ -614,6 +614,10 @@ async def artifact(request: Request) -> Response:
 
 _LIVE_KEY = re.compile(r"(?:(?:Control|Shift|Alt|Meta)\+){0,3}(?:[A-Za-z0-9]{1,16}|[-=\[\];',./`\\])")
 _NO_STORE = {"Cache-Control": "no-store"}
+# A drag's points that collected while its previous move was on its way: a few frames' worth, replayed in at
+# most a second so the release isn't held up.
+MAX_MOVE_PATH_POINTS = 32
+MAX_MOVE_PATH_MS = 1000
 
 
 def _route_caller(request: Request, capability: str) -> Caller | JSONResponse:
@@ -652,6 +656,24 @@ def _coordinate(value: Any, maximum: int) -> float:
     return float(value)
 
 
+def _move_path(value: Any) -> list[tuple[float, float, int]]:
+    """A move's points as [x, y, ms after the first], in order, usually ending at the move's (x, y)."""
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_MOVE_PATH_POINTS:
+        raise WorkerError("move path is invalid", code="invalid_request")
+    path: list[tuple[float, float, int]] = []
+    for point in value:
+        if not isinstance(point, list) or len(point) != 3:
+            raise WorkerError("move path is invalid", code="invalid_request")
+        x, y, at = point
+        if (
+            isinstance(at, bool) or not isinstance(at, int) or not 0 <= at <= MAX_MOVE_PATH_MS
+            or (path and at < path[-1][2])
+        ):
+            raise WorkerError("move path is invalid", code="invalid_request")
+        path.append((_coordinate(x, VIEWPORT_WIDTH), _coordinate(y, VIEWPORT_HEIGHT), at))
+    return path
+
+
 def _delta(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or abs(value) > 10_000:
         raise WorkerError("scroll delta is invalid", code="invalid_request")
@@ -667,7 +689,8 @@ def parse_live_input(body: Any) -> dict[str, Any]:
         "click": {"type", "x", "y", "button", "click_count"},
         "wheel": {"type", "x", "y", "dx", "dy"},
         "down": {"type", "x", "y", "button"},
-        "move": {"type", "x", "y"},
+        # A drag's points since the last move, so the page sees the path the person's pointer took.
+        "move": {"type", "x", "y", "path"},
         "up": {"type", "x", "y", "button"},
         "key": {"type", "key"},
         "text": {"type", "text"},
@@ -699,6 +722,8 @@ def parse_live_input(body: Any) -> dict[str, Any]:
         if button not in {"left", "middle", "right"}:
             raise WorkerError("button is invalid", code="invalid_request")
         event["button"] = button
+    elif kind == "move" and "path" in body:
+        event["path"] = _move_path(body["path"])
     elif kind == "wheel":
         event.update(dx=_delta(body.get("dx", 0)), dy=_delta(body.get("dy", 0)))
     elif kind == "key":
