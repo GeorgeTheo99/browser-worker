@@ -10,7 +10,6 @@ from typing import Any
 
 from patchright.async_api import Error, Frame, JSHandle, Page
 
-from controls import check_access
 from errors import WorkerError, fail
 from security import NetworkPolicyError, parse_public_url
 
@@ -64,7 +63,6 @@ async def check_frame_access(page: Page, frame: Frame) -> None:
         url = await current.evaluate('location.href')
         if current == page.main_frame or url not in {'about:blank', 'about:srcdoc'}:
             parse_public_url(url)
-        await check_access(current)
 
 
 @dataclass

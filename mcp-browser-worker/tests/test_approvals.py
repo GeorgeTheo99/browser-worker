@@ -274,21 +274,14 @@ async def test_ownership_expiry_replacement_close_and_validation(approved):
     assert (await execute(sid, pending))['code'] == 'invalid_session'
 
 
-async def test_access_blocks_discovery_prepare_and_execution(approved):
+async def test_a_check_page_allows_discovery_prepare_and_execution(approved):
+    # The owner lets the caller get past a bot check (2026-11-25): such a page is acted on like any other.
     _, sid, page, _, _ = approved
-    proposal = await prepare(sid, 'evaluate', script='window.forbidden = true')
     await page.evaluate("document.title = 'Access denied'")
-    for action in ['elements', 'prepare_action']:
-        kwargs = {'operation': 'click', 'selector': '#clicker'} if action == 'prepare_action' else {}
-        assert (await call(sid, action, **kwargs))['code'] == 'blocked_access'
-    # Failed replacement has already discarded the previous proposal.
-    assert (await execute(sid, proposal))['code'] == 'approval_unavailable'
-    await page.evaluate("document.title = 'Fixture'")
-    proposal = await prepare(sid, 'evaluate', script='window.forbidden = true')
-    await page.evaluate("document.title = 'Access denied'")
-    assert (await execute(sid, proposal))['code'] == 'blocked_access'
-    assert (await execute(sid, proposal))['code'] == 'approval_unavailable'
-    assert not await page.evaluate('Boolean(window.forbidden)')
+    assert (await call(sid, 'elements'))['status'] == 'ok'
+    proposal = await prepare(sid, 'evaluate', script='window.allowed = true')
+    assert (await execute(sid, proposal))['status'] == 'ok'
+    assert await page.evaluate('Boolean(window.allowed)')
 
 
 async def test_cancellation_consumes_and_cleans_session(approved, monkeypatch):

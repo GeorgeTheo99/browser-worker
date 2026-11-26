@@ -172,15 +172,13 @@ async def test_frame_refs_not_transferable_to_tabs_sessions_or_changed_documents
 
 
 @pytest.mark.parametrize('target', ['selected', 'parent', 'top'])
-async def test_frame_access_checks_all_ancestors(framed, target):
+async def test_a_check_page_anywhere_in_the_chain_doesnt_block_a_frame(framed, target):
+    # A CAPTCHA's own frames are where its checkbox is (owner 2026-11-25: the caller may get past a check).
     _, sid, page, child, nested, _, _ = framed
     fid = (await frame_rows(sid))[-1]['frame_id']
-    proposal = await prepare(sid, frame_id=fid, selector='#go')
     frame = {'selected': nested, 'parent': child, 'top': page.main_frame}[target]
     await frame.evaluate("document.title='Access denied'")
-    assert (await call(sid, 'elements', frame_id=fid))['code'] == 'blocked_access'
-    assert (await execute(sid, proposal))['code'] == 'blocked_access'
-    assert await nested.evaluate('window.clicks') == 0
+    assert (await call(sid, 'elements', frame_id=fid))['status'] == 'ok'
 
 
 @pytest.mark.parametrize('action,selector', [
@@ -198,10 +196,10 @@ async def test_extraction_cannot_enter_unchecked_child_with_selector(framed, act
     assert result['code'] == 'invalid_selector'
     result = await call(sid, action, frame_id=rows[1]['frame_id'], selector=through_one)
     assert result['code'] == 'invalid_selector'
-    assert (await call(sid, action, frame_id=rows[-1]['frame_id'], selector=selector))['code'] == 'blocked_access'
-    # Discovery leaves the blocked frame out and still lists the rest.
+    # A check page's frame is listed and read like any other.
+    assert (await call(sid, action, frame_id=rows[-1]['frame_id'], selector=selector))['status'] == 'ok'
     listed = await call(sid, 'frames')
-    assert listed['status'] == 'ok' and [row['url'] for row in listed['frames']] == [row['url'] for row in rows[:-1]]
+    assert listed['status'] == 'ok' and [row['url'] for row in listed['frames']] == [row['url'] for row in rows]
     # Same-origin DOM access is not an exception to the explicit frame boundary.
     await child.evaluate("document.title='Access denied'")
     assert (await call(sid, action, selector=through_one))['code'] == 'invalid_selector'
@@ -456,5 +454,47 @@ async def test_scroll_in_an_embedded_frame_moves_that_frame_and_never_wheels_int
         # The frame inside it fills the middle of the frame's visible part.
         assert (await call(sid, 'scroll', frame_id=fid, selector='body', dy=100))['code'] == 'point_in_frame'
         assert await nested.evaluate('scrollY') == 0
+    finally:
+        auth._current_caller.reset(token)
+
+
+async def test_click_at_reaches_a_checks_checkbox_in_its_frame(approved, monkeypatch):
+    # A CAPTCHA's checkbox sits in its provider's frame (Cloudflare's in a closed shadow root): on a check page only,
+    # a point of the screenshot may land there (owner 2026-11-25: the caller may get past a check).
+    _, sid, page, _, _ = approved
+    await page.evaluate('''() => new Promise(resolve => {
+      document.title = 'Just a moment...';
+      document.body.innerHTML = '<p>Verify you are human by completing the action below.</p>';
+      const host = document.createElement('div');
+      host.style = 'position:fixed;left:0;top:100px;width:300px;height:70px';
+      document.body.append(host);
+      const frame = document.createElement('iframe');
+      frame.style = 'width:300px;height:70px;border:0';
+      frame.srcdoc = '<input type=checkbox style="width:30px;height:30px" onclick="parent.checked = true">';
+      frame.onload = () => resolve();
+      host.attachShadow({mode: 'closed'}).append(frame);
+    })''')
+    import browser_runtime
+
+    token = auth._current_caller.set(Caller('research', frozenset({'inspect.read', 'inspect.interact'})))
+    try:
+        # Only a CAPTCHA provider's frame (this test's srcdoc frame stands in for one), and only on a check page.
+        assert (await call(sid, 'click_at', x=20, y=118))['code'] == 'point_in_frame'
+        monkeypatch.setattr(browser_runtime, 'captcha_frame_url', lambda url: url == 'about:srcdoc')
+        assert (await call(sid, 'click_at', x=20, y=118, check_only='frame'))['status'] == 'ok'
+        assert await page.evaluate('window.checked === true')
+        # A main-page point is refused to a caller asking for the frame only; off a check page, check_only refuses.
+        assert (await call(sid, 'click_at', x=600, y=20, check_only='frame'))['code'] == 'not_a_check'
+        # Something covering the frame's box takes no click through it.
+        await page.evaluate("""() => document.body.insertAdjacentHTML('beforeend',
+          '<button id=buy style="position:fixed;left:0;top:100px;width:300px;height:70px;z-index:9"'
+          + ' onclick="window.bought = true">Place order</button>')""")
+        for check_only in ('frame', 'page'):
+            assert (await call(sid, 'click_at', x=20, y=118, check_only=check_only))['code'] == 'point_in_frame'
+        assert not await page.evaluate('Boolean(window.bought)')
+        await page.evaluate("document.getElementById('buy').remove()")
+        await page.evaluate("document.title = 'Shop'; document.querySelector('p').remove()")
+        assert (await call(sid, 'click_at', x=600, y=20, check_only='page'))['code'] == 'not_a_check'
+        assert (await call(sid, 'click_at', x=20, y=118))['code'] == 'point_in_frame'
     finally:
         auth._current_caller.reset(token)

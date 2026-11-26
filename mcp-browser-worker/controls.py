@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
@@ -76,7 +77,8 @@ _INSPECT = r"""el => {
 }"""
 
 # A CAPTCHA widget counts only when it shows: payment forms (Stripe's invisible hCaptcha) and ads embed hidden ones.
-_BLOCKED = r"""() => {
+# Such a page is not refused (the owner lets the caller get past it, 2026-11-25): click_at may then reach its frames.
+_CHECK_PAGE = r"""() => {
   const title = document.title.slice(0, 500);
   const body = (document.body?.innerText || '').slice(0, 8000);
   const shown = e => { const r = e.getBoundingClientRect(); return r.width >= 30 && r.height >= 30 && e.checkVisibility({visibilityProperty: true}); };
@@ -87,9 +89,30 @@ _BLOCKED = r"""() => {
 }"""
 
 
-async def check_access(page: Page | Frame) -> None:
-    if await page.evaluate(_BLOCKED):
-        raise fail("blocked_access")
+# Where CAPTCHA and bot-check widgets live: a click_at point on a check page may land only in a frame from one of these.
+CAPTCHA_FRAME_HOSTS = (
+    "challenges.cloudflare.com", "hcaptcha.com", "recaptcha.net", "captcha-delivery.com", "arkoselabs.com",
+    "funcaptcha.com", "perimeterx.net", "px-cloud.net", "px-cdn.net", "geetest.com", "awswaf.com",
+)
+
+
+def captcha_frame_url(url: str) -> bool:
+    """Whether a frame's address is a CAPTCHA provider's (Google's reCAPTCHA only under /recaptcha/)."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host:
+        return False
+    if host in {"www.google.com", "google.com", "www.recaptcha.net", "recaptcha.net"}:
+        return parsed.path.startswith("/recaptcha/")
+    return any(host == known or host.endswith("." + known) for known in CAPTCHA_FRAME_HOSTS)
+
+
+async def is_check_page(page: Page | Frame) -> bool:
+    """Whether the page is a bot check or CAPTCHA (or a block page) rather than the site's content."""
+    return bool(await page.evaluate(_CHECK_PAGE))
 
 
 @dataclass
@@ -222,7 +245,6 @@ class ControlStore:
                 await node.dispose()
         if ref.epoch != self.epoch or ref.url != page.url:
             raise fail("stale_control")
-        await check_access(page)
         info, nodes = await self._snapshot(ref.element)
         for node in nodes:
             await node.dispose()
@@ -232,7 +254,6 @@ class ControlStore:
     async def run(self, page: Page, action: str, control_id: str = "", option: str | None = None) -> dict[str, Any]:
         try:
             async with asyncio.timeout(CONTROL_TIMEOUT_MS / 1000):
-                await check_access(page)
                 if action == "controls":
                     return await self.discover(page)
                 return await self.act(page, action, control_id, option)

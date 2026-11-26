@@ -16,7 +16,6 @@ from urllib.parse import urlsplit
 from patchright.async_api import ElementHandle, Error, Frame, JSHandle, Page
 from patchright.async_api import TimeoutError as BrowserTimeoutError
 
-from controls import check_access
 from errors import fail
 from frames import DocumentRef, ancestry, check_frame_access
 from pickers import control_kind
@@ -272,7 +271,6 @@ async def discover_elements(
     """
     try:
         async with asyncio.timeout(3):
-            await check_access(page)
             found = await page.evaluate_handle(
                 _ELEMENTS, {"limit": min(100, max(1, limit)), "text": text or "", "within": within or ""}
             )

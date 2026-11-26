@@ -42,7 +42,7 @@ from config import (
 from errors import ERROR_MESSAGES
 from frames import FRAME_ACTIONS
 from pickers import MAX_PICKER_OPTIONS, MAX_VALUE
-from security import NetworkPolicyError, parse_public_url
+from security import NetworkPolicyError, SiteUnreachable, parse_public_url
 
 logger = logging.getLogger("browser-worker.mcp")
 
@@ -168,6 +168,8 @@ async def _safe_call(coro: Any, *, total_seconds: float = 90.0) -> ToolResult:
         return _error_result("capability_denied")
     except WorkerError as exc:
         return _error_result(exc.code)
+    except SiteUnreachable:
+        return _error_result("site_unreachable")
     except NetworkPolicyError:
         return _error_result("blocked_access")
     except ArtifactError:
@@ -269,6 +271,7 @@ async def browser_inspect(
     dy: Annotated[float | None, Field(ge=-10_000, le=10_000)] = None,
     capture_id: Annotated[str | None, Field(pattern=r"^[A-Za-z0-9_-]{16}$")] = None,
     track: bool = False,
+    check_only: Literal["page", "frame"] | None = None,
     frame_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
     control_id: Annotated[str | None, Field(min_length=1, max_length=128)] = None,
     option: Annotated[str | None, Field(min_length=1, max_length=200)] = None,
@@ -307,7 +310,8 @@ async def browser_inspect(
     or dropdown option contains it, and `selector` lists only inside the elements it matches. A dropdown list (a
     `select`) lists its `options` and `selected` one: choose with `select_option`, its `ref` and an exact
     option label (clicking or typing into one is refused, since Chromium draws its list outside the page). `click_at` clicks the point `x`,`y` of the
-    visible page, in the CSS pixels of a screenshot with `full_page` false. `scroll` with `dx`/`dy` turns the
+    visible page, in the CSS pixels of a screenshot with `full_page` false (on a bot check page it may land in the
+    CAPTCHA provider's frame; `check_only` "page" or "frame" clicks only on a check page, or only into that frame). `scroll` with `dx`/`dy` turns the
     mouse wheel by that many CSS pixels (positive `dy` goes down) over a `ref`/`selector` element, the point
     `x`,`y`, or else the middle of the visible page, and says which area moved; with only an element, it scrolls
     that element into view. A viewport screenshot with `track`
@@ -338,6 +342,8 @@ async def browser_inspect(
             raise WorkerError("x and y go together, for click_at, scroll, or elements at a point")
         if (dx is not None or dy is not None) and action != "scroll":
             raise WorkerError("dx and dy are only for scroll")
+        if check_only is not None and action != "click_at":
+            raise WorkerError("check_only is only for click_at")
         if (capture_id is not None) != (action == "elements" and pointed) or (track and action != "screenshot"):
             raise WorkerError("elements at a point needs its screenshot's capture_id; track is only for screenshot")
         if frame_id is not None:
@@ -486,6 +492,8 @@ async def browser_inspect(
             if not (math.isfinite(x) and math.isfinite(y)):  # type: ignore[arg-type]
                 raise WorkerError("x and y must be finite")
             params["x"], params["y"] = x, y
+            if check_only is not None:
+                params["check_only"] = check_only
         elif action == "scroll":
             caller.require("inspect.interact")
             targeted = selector is not None or ref is not None
@@ -638,7 +646,7 @@ def _route_caller(request: Request, capability: str) -> Caller | JSONResponse:
 
 def _route_error(exc: WorkerError) -> JSONResponse:
     status = {
-        "invalid_session": 404, "session_busy": 409, "stale_picker": 410, "blocked_access": 403,
+        "invalid_session": 404, "session_busy": 409, "stale_picker": 410, "blocked_access": 403, "site_unreachable": 502,
         "invalid_request": 400, "unsupported_control": 400,
     }.get(
         exc.code, 502

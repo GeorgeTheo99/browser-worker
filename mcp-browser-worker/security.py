@@ -21,6 +21,11 @@ class NetworkPolicyError(ValueError):
     pass
 
 
+class SiteUnreachable(NetworkPolicyError):
+    """The destination's name didn't resolve (or the lookup failed, as when the worker is out of file descriptors):
+    nothing reached it, but nothing about it is private either, so callers say "unreachable", not "blocked"."""
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedTarget:
     hostname: str
@@ -103,7 +108,7 @@ class PublicResolver:
                 timeout=DNS_TIMEOUT_SECONDS,
             )
         except (TimeoutError, OSError, socket.gaierror) as exc:
-            raise NetworkPolicyError("destination DNS resolution failed") from exc
+            raise SiteUnreachable("destination DNS resolution failed") from exc
         addresses: list[str] = []
         for _family, _kind, _proto, _canon, sockaddr in records:
             address = str(sockaddr[0]).split("%", 1)[0]

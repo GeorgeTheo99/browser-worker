@@ -66,7 +66,7 @@ from config import (
     VIEWPORT_HEIGHT,
     VIEWPORT_WIDTH,
 )
-from controls import ControlStore
+from controls import ControlStore, captcha_frame_url, is_check_page
 from errors import WorkerError, fail
 from frames import FRAME_ACTIONS, NAVIGATION_INIT_SCRIPT, FrameStore, check_frame_access
 from live import LiveView
@@ -85,6 +85,7 @@ from security import (
     NetworkPolicyError,
     PublicEgressProxy,
     PublicResolver,
+    SiteUnreachable,
     parse_public_url,
     resolve_public_url,
 )
@@ -305,6 +306,16 @@ _AT_POINT_ROW = """(el, control) => {""" + _DOM_HELPERS + """
 }"""
 _CONTROL_QUERY = 'a[href],button,input:not([type="hidden"]),textarea,select,summary,label,[role],[tabindex],[onclick],[contenteditable="true"]'
 # The element a point of the visible page lands on, through open shadow roots; null outside the page.
+# Whether `el` (what elementFromPoint found) is the frame element `fe` or a shadow host it sits in (a closed shadow root,
+# as Cloudflare's checkbox uses, hides the frame behind its host).
+_HOLDS_FRAME = """(el, fe) => {
+  for (let node = fe; node; ) {
+    if (node === el) return true;
+    const root = node.getRootNode();
+    node = root instanceof ShadowRoot ? root.host : null;
+  }
+  return false;
+}"""
 _POINT_HIT = """([x, y]) => {
   if (x >= innerWidth || y >= innerHeight) return null;
   let el = document.elementFromPoint(x, y);
@@ -727,16 +738,24 @@ class BrowserManager:
         return owner_frame, element, False
 
     @staticmethod
-    async def _no_child_frame_at(frame: Frame, x: float, y: float) -> None:
-        """A point of the visible page never lands in a frame embedded in `frame`, wherever it sits (a shadow
-        root hides it from elementFromPoint): a frame's own origin checks apply only through frames and frame_id."""
+    async def _child_frame_at(frame: Frame, x: float, y: float) -> Frame | None:
+        """The frame embedded in `frame` that a point of the visible page lands in, wherever it sits (a shadow root
+        hides it from elementFromPoint), or None."""
         for child in frame.child_frames:
             try:
                 box = await (await child.frame_element()).bounding_box()
             except BrowserError:  # gone meanwhile
                 continue
             if box and box["x"] <= x < box["x"] + box["width"] and box["y"] <= y < box["y"] + box["height"]:
-                raise fail("point_in_frame")
+                return child
+        return None
+
+    @classmethod
+    async def _no_child_frame_at(cls, frame: Frame, x: float, y: float) -> None:
+        """A point of the visible page never lands in a frame embedded in `frame`: a frame's own origin checks
+        apply only through frames and frame_id."""
+        if await cls._child_frame_at(frame, x, y) is not None:
+            raise fail("point_in_frame")
 
     async def _track_layout(self, session: BrowserSession, page: Page, capture: Any) -> tuple[Any, str | None]:
         """Run `capture` (a screenshot) and remember which element was where just before and just after it."""
@@ -800,10 +819,28 @@ class BrowserManager:
         await self._replace_refs(session, page.main_frame, [row], [element])
         return {"status": "ok", "session_id": session.id, "elements": [row], "truncated": False}
 
-    async def _click_at(self, session: BrowserSession, page: Page, x: float, y: float) -> dict[str, object]:
-        """Click a point of the visible page (CSS pixels, as in a screenshot of it), and say what it hit."""
+    async def _click_at(self, session: BrowserSession, page: Page, x: float, y: float,
+                        check_only: str | None = None) -> dict[str, object]:
+        """Click a point of the visible page (CSS pixels, as in a screenshot of it), and say what it hit. On a bot
+        check page the point may be in a CAPTCHA provider's frame (where its checkbox is). `check_only` "page" clicks
+        only while the page is a check, "frame" only into such a frame (a caller with gated clicks elsewhere), both
+        decided in this call."""
         await check_frame_access(page, page.main_frame)
-        await self._no_child_frame_at(page.main_frame, x, y)
+        check_page = await is_check_page(page.main_frame)
+        if check_only and not check_page:
+            raise fail("not_a_check")
+        child = await self._child_frame_at(page.main_frame, x, y)
+        if child is not None:
+            if not check_page:
+                raise fail("point_in_frame")
+            try:
+                child_url = await child.evaluate("location.href")
+            except BrowserError:
+                child_url = child.url
+            if not captcha_frame_url(str(child_url or "")):
+                raise fail("point_in_frame")
+        elif check_only == "frame":
+            raise fail("not_a_check")
         hit = await page.evaluate_handle(_POINT_HIT, [x, y])
         element = hit.as_element()
         if element is None:
@@ -813,10 +850,21 @@ class BrowserManager:
             target = await element.evaluate(
                 "el => {" + _DOM_HELPERS + "return {tag: el.tagName.toLowerCase(), label: label(el).slice(0, 200)}; }"
             )
-            if target["tag"] in {"iframe", "frame"}:
+            if child is not None:
+                # What is on top at the point must be that CAPTCHA's frame (or the shadow host it sits in), not
+                # something covering its box: a main-page button there would otherwise take the click.
+                frame_element = await child.frame_element()
+                try:
+                    on_top = await element.evaluate(_HOLDS_FRAME, frame_element)
+                finally:
+                    await frame_element.dispose()
+                if not on_top:
+                    raise fail("point_in_frame")
+            elif target["tag"] in {"iframe", "frame"}:
                 raise fail("point_in_frame")
-            await self._no_upload(element)
-            await self._no_popup(element)
+            else:
+                await self._no_upload(element)
+                await self._no_popup(element)
         finally:
             await element.dispose()
         try:
@@ -1601,6 +1649,8 @@ class BrowserManager:
             navigation.cancel()
             await asyncio.gather(navigation, return_exceptions=True)
             raise
+        except SiteUnreachable as exc:
+            raise WorkerError("the site couldn't be reached", code="site_unreachable") from exc
         except NetworkPolicyError as exc:
             raise WorkerError("browser navigation was blocked by public-network policy", code="blocked_access") from exc
         except Exception as exc:
@@ -2000,7 +2050,8 @@ class BrowserManager:
                 if action == "upload":
                     return await self._upload(session, page, frame, params, timeout_ms)
                 if action == "click_at":
-                    return await self._click_at(session, page, float(params["x"]), float(params["y"]))
+                    return await self._click_at(session, page, float(params["x"]), float(params["y"]),
+                                                params.get("check_only"))
                 if action == "scroll":
                     return await self._scroll(session, page, frame, params, timeout_ms)
                 if action == "wait":

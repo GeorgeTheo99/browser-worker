@@ -86,8 +86,31 @@ def build_app():
     )
 
 
+# Each page connection the browser makes through a session's egress proxy holds two descriptors here, so a busy page
+# (a car listing site opens hundreds) ran past launchd's default of 256: accept() and DNS lookups then failed with
+# "Too many open files", which surfaced as failed or blocked browser calls (3,276 in Nov 2026's log).
+OPEN_FILES_WANTED = 10_240
+
+
+def raise_open_file_limit(wanted: int = OPEN_FILES_WANTED) -> int:
+    """Raise this process's soft limit on open files toward `wanted` (never past the hard limit, nor down)."""
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+    if soft != resource.RLIM_INFINITY and soft < target:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            soft = target
+        except (ValueError, OSError):
+            logging.getLogger(__name__).warning("couldn't raise the open-file limit from %s", soft)
+    return soft
+
+
 def main() -> None:
     import uvicorn
+
+    raise_open_file_limit()
 
     address = {"uds": MCP_SOCKET} if MCP_SOCKET else {"host": MCP_HOST, "port": MCP_PORT}
     uvicorn.run(

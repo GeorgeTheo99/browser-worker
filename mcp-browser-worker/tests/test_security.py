@@ -177,3 +177,21 @@ async def test_proxy_blocks_private_connect() -> None:
         assert b"403 Browser Worker Policy" in await ws_reader.read()
     finally:
         await proxy.close()
+
+
+async def test_a_name_that_doesnt_resolve_is_unreachable_not_blocked(monkeypatch):
+    import asyncio
+
+    from security import NetworkPolicyError, PublicResolver, SiteUnreachable
+
+    async def fail(*_args, **_kwargs):
+        raise OSError(24, "Too many open files")
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fail)
+    try:
+        await PublicResolver().resolve("www.cars.com", 443)
+    except SiteUnreachable as exc:
+        assert isinstance(exc, NetworkPolicyError)  # the proxy still treats it as a refusal
+    else:
+        raise AssertionError("expected SiteUnreachable")

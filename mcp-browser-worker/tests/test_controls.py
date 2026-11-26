@@ -279,9 +279,10 @@ async def test_bounds_ambiguity_credentials_and_blocked_access(browser):
     assert (await call(sid, "expand_control", control_id=custom_id))["code"] == "ambiguous_control"
     await page.evaluate("document.body.insertAdjacentHTML('beforeend','<input type=password value=VERY_SECRET>')")
     assert (await call(sid, "controls"))["controls"] == []
+    # A check or block page isn't refused (the owner lets the caller get past a check, 2026-11-25).
     await page.evaluate("document.title='Access denied'")
-    assert (await call(sid, "controls"))["code"] == "blocked_access"
-    assert (await call(sid, "extract_text"))["code"] == "blocked_access"
+    assert (await call(sid, "controls"))["controls"] == []
+    assert (await call(sid, "extract_text"))["status"] == "ok"
 
 
 @pytest.mark.browser
@@ -308,7 +309,7 @@ async def test_extraction_is_bounded_and_errors_do_not_leak(browser):
 async def test_safe_exception_boundary_and_extraction_timeout(monkeypatch):
     from patchright.async_api import TimeoutError as BrowserTimeoutError
 
-    from security import NetworkPolicyError
+    from security import NetworkPolicyError, SiteUnreachable
 
     async def fail_with(exc):
         raise exc
@@ -316,6 +317,7 @@ async def test_safe_exception_boundary_and_extraction_timeout(monkeypatch):
     for exc, code in [(RuntimeError("SECRET /private/path bearer abc"), "operation_failed"),
                       (WorkerError("SECRET"), "operation_failed"),
                       (NetworkPolicyError("SECRET"), "blocked_access"),
+                      (SiteUnreachable("SECRET"), "site_unreachable"),
                       (TimeoutError("SECRET"), "operation_timeout")]:
         result = await mcp_server._safe_call(fail_with(exc))
         assert result.structured_content["code"] == code
@@ -705,15 +707,18 @@ async def test_elements_at_a_point_box_covers_everything_the_control_paints(brow
 
 
 @pytest.mark.browser
-async def test_only_a_captcha_that_shows_blocks_the_page(browser):
+async def test_only_a_captcha_that_shows_makes_a_check_page(browser):
+    from controls import is_check_page
     _, sid, page, _, _ = browser
     # Payment forms and ads embed invisible CAPTCHA frames; they aren't a check for a person.
     await page.evaluate("""() => document.body.insertAdjacentHTML('beforeend',
       '<iframe src="/hcaptcha-invisible" style="display:none"></iframe><iframe src="/recaptcha/anchor" width=0 height=0></iframe>')""")
-    assert (await call(sid, "extract_text"))["status"] == "ok"
+    assert not await is_check_page(page.main_frame)
     await page.evaluate("""() => document.body.insertAdjacentHTML('beforeend',
       '<div class=g-recaptcha style="width:304px;height:78px"></div>')""")
-    assert (await call(sid, "extract_text"))["code"] == "blocked_access"
+    assert await is_check_page(page.main_frame)
+    # It is read like any page: the caller decides what to do about the check.
+    assert (await call(sid, "extract_text"))["status"] == "ok"
 
 
 @pytest.mark.browser
@@ -742,3 +747,14 @@ async def test_what_the_agent_looks_for_or_reads_is_scrolled_into_view_for_the_l
         assert (await call(sid, "extract_text"))["status"] == "ok" and await page.evaluate("scrollY") == before
     finally:
         auth._current_caller.reset(token)
+
+
+def test_captcha_frames_are_known_by_their_provider():
+    from controls import captcha_frame_url
+    for url in ("https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2/av0/rcv0/0/x",
+                "https://newassets.hcaptcha.com/captcha/v1/abc/static/hcaptcha.html",
+                "https://www.google.com/recaptcha/api2/anchor?k=x", "https://geo.captcha-delivery.com/captcha/?x=1"):
+        assert captcha_frame_url(url), url
+    for url in ("https://www.google.com/search?q=x", "http://challenges.cloudflare.com/x", "https://evilhcaptcha.com/x",
+                "https://shop.example/checkout", "about:srcdoc", ""):
+        assert not captcha_frame_url(url), url
